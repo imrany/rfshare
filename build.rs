@@ -8,11 +8,11 @@ fn main() {
 
         // Publisher / version strings shown in Add/Remove Programs and UAC prompts
         res.set("ProductName", "rfshare");
-        res.set("FileDescription", "Fast, encrypted LAN file transfers");
+        res.set("FileDescription", "Fast, encrypted file transfers");
         res.set("CompanyName", "Imrany");
-        res.set("LegalCopyright", "Copyright © 2025 Imrany");
-        res.set("ProductVersion", "0.5.2");
-        res.set("FileVersion", "0.5.2");
+        res.set("LegalCopyright", "Copyright © 2026 Imrany");
+        res.set("ProductVersion", "0.8.0");
+        res.set("FileVersion", "0.8.0");
 
         // Request the lowest privilege level — prevents UAC elevation prompts.
         // The app only uses local network sockets; it needs no admin rights.

@@ -1,13 +1,13 @@
 [Desktop Entry]
 Type=Application
-Version=0.6.0
+Version=0.8.0
 Name=rfshare
 GenericName=File Transfer
-Comment=Fast, encrypted LAN file transfers
+Comment=Fast, encrypted file transfers
 Exec=rfshare
 Icon=rfshare
 Terminal=false
-Categories=Network;FileTransfer;Utility;
-Keywords=file;transfer;lan;network;share;send;
+Categories=Network;FileTransfer;Utility;Remote;
+Keywords=file;transfer;remote;network;share;send;
 StartupNotify=true
 StartupWMClass=rfshare

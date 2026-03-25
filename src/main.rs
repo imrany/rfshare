@@ -32,6 +32,107 @@ const MAGIC_DATA: u8 = 0x03;
 const MAGIC_DONE: u8 = 0x04;
 const MAGIC_SKIP: u8 = 0x05; // receiver already has this version — sender should skip
 const SYNC_POLL_MS: u64 = 2_000; // how often the sync watcher polls each folder
+const MAGIC_PING: u8 = 0x06;   // lightweight keepalive / version handshake
+const RELAY_HOST: &str = "relay.rfshare.dev";
+const RELAY_PORT: u16  = 9000;
+
+/// Generate a random 8-char session code like "A3F7-K2M9"
+fn gen_session_code() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Use entropy from current time + stack address
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH).unwrap_or_default()
+        .subsec_nanos();
+    let chars: Vec<char> = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".chars().collect();
+    let mut n = seed as usize;
+    let mut code = String::new();
+    for i in 0..8 {
+        if i == 4 { code.push('-'); }
+        n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        code.push(chars[(n >> 33) % chars.len()]);
+    }
+    code
+}
+
+/// Receiver: connect to relay, register a code, wait for sender to join
+fn relay_listen(tx: std::sync::mpsc::Sender<RelayMsg>) {
+    let code = gen_session_code();
+    let _ = tx.send(RelayMsg::Code(code.clone()));
+
+    let mut stream = match std::net::TcpStream::connect((RELAY_HOST, RELAY_PORT)) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(RelayMsg::Error(format!("Cannot reach relay: {}", e)));
+            return;
+        }
+    };
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(120))).ok();
+
+    // Register as receiver
+    if writeln!(stream, "RECEIVER {}", code).is_err() {
+        let _ = tx.send(RelayMsg::Error("Relay write error".into()));
+        return;
+    }
+    let _ = stream.flush();
+
+    // Wait for PAIRED response (up to 2 minutes)
+    let mut buf = String::new();
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    use std::io::BufRead;
+    match reader.read_line(&mut buf) {
+        Ok(0) => { let _ = tx.send(RelayMsg::Error("Relay closed".into())); return; }
+        Err(e) => { let _ = tx.send(RelayMsg::Error(format!("Relay: {}", e))); return; }
+        Ok(_) => {}
+    }
+    let line = buf.trim();
+    if line.starts_with("PAIRED") {
+        let peer = line.strip_prefix("PAIRED ").unwrap_or("remote").to_string();
+        let _ = tx.send(RelayMsg::Paired { peer });
+        // Hand off the raw stream for the file transfer
+        let holder = Arc::new(Mutex::new(Some(stream)));
+        let _ = tx.send(RelayMsg::Ready(holder));
+    } else {
+        let _ = tx.send(RelayMsg::Error(format!("Unexpected relay response: {}", line)));
+    }
+}
+
+/// Sender: connect to relay using the code the receiver shared
+fn relay_connect(code: &str, tx: std::sync::mpsc::Sender<RelayMsg>) {
+    let mut stream = match std::net::TcpStream::connect((RELAY_HOST, RELAY_PORT)) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(RelayMsg::Error(format!("Cannot reach relay: {}", e)));
+            return;
+        }
+    };
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
+
+    if writeln!(stream, "SENDER {}", code.trim()).is_err() {
+        let _ = tx.send(RelayMsg::Error("Relay write error".into()));
+        return;
+    }
+    let _ = stream.flush();
+
+    let mut buf = String::new();
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    use std::io::BufRead;
+    match reader.read_line(&mut buf) {
+        Ok(0) => { let _ = tx.send(RelayMsg::Error("Relay closed connection".into())); return; }
+        Err(e) => { let _ = tx.send(RelayMsg::Error(format!("Relay: {}", e))); return; }
+        Ok(_) => {}
+    }
+    let line = buf.trim();
+    if line.starts_with("PAIRED") {
+        let peer = line.strip_prefix("PAIRED ").unwrap_or("remote").to_string();
+        let _ = tx.send(RelayMsg::Paired { peer: peer.clone() });
+        let holder = Arc::new(Mutex::new(Some(stream)));
+        let _ = tx.send(RelayMsg::Ready(holder));
+    } else if line == "NOT_FOUND" {
+        let _ = tx.send(RelayMsg::Error("Code not found or expired".into()));
+    } else {
+        let _ = tx.send(RelayMsg::Error(format!("Unexpected: {}", line)));
+    }
+}
 
 // ─── Persistence helpers ─────────────────────────────────────────────────────
 fn prefs_path() -> Option<PathBuf> {
@@ -51,6 +152,7 @@ fn save_prefs(
     save_dir: Option<&PathBuf>,
     notify_on_receive: bool,
     auto_open_folder: bool,
+    manual_peers: &[(String,String)],
 ) {
     let Some(path) = prefs_path() else { return };
     if let Some(parent) = path.parent() {
@@ -63,6 +165,10 @@ fn save_prefs(
     for (device_addr, folder) in sync_map {
         let safe = device_addr.replace('.', "_").replace(':', "_");
         out.push_str(&format!("sync_device_{}={}\n", safe, folder.display()));
+    }
+    for (i, (name, addr)) in manual_peers.iter().enumerate() {
+        out.push_str(&format!("manual_peer_{}_name={}\n", i, name));
+        out.push_str(&format!("manual_peer_{}_addr={}\n", i, addr));
     }
     if let Some(ref d) = save_dir {
         out.push_str(&format!("save_dir={}\n", d.display()));
@@ -81,42 +187,44 @@ struct SavedPrefs {
     save_dir: Option<PathBuf>,
     notify_on_receive: bool,
     auto_open_folder: bool,
+    manual_peers: Vec<(String, String)>,  // (name, addr_str)
 }
 
 fn load_prefs() -> SavedPrefs {
     let mut prefs = SavedPrefs::default();
-    let Some(path) = prefs_path() else {
-        return prefs;
-    };
-    let Ok(text) = fs::read_to_string(&path) else {
-        return prefs;
-    };
+    let Some(path) = prefs_path() else { return prefs };
+    let Ok(text) = fs::read_to_string(&path) else { return prefs };
+
+    let mut mp_names: std::collections::HashMap<usize, String> = Default::default();
+    let mut mp_addrs: std::collections::HashMap<usize, String> = Default::default();
+
     for line in text.lines() {
-        if let Some(v) = line.strip_prefix("selected_peer_name=") {
-            prefs.peer_name = v.to_string();
-        }
-        if let Some(v) = line.strip_prefix("selected_peer_addr=") {
-            prefs.peer_addr = v.to_string();
-        }
-        // sync_device_<safe_addr>=<folder_path>
+        if let Some(v) = line.strip_prefix("selected_peer_name=") { prefs.peer_name = v.to_string(); }
+        if let Some(v) = line.strip_prefix("selected_peer_addr=") { prefs.peer_addr = v.to_string(); }
         if let Some(rest) = line.strip_prefix("sync_device_") {
             if let Some(eq) = rest.find('=') {
-                let safe_addr = &rest[..eq];
-                let folder = &rest[eq + 1..];
-                // Restore dots from underscores (safe for IPv4; IPv6 uses colons stored as _)
-                let addr = safe_addr.replace('_', ".");
-                prefs.sync_map.insert(addr, PathBuf::from(folder));
+                let addr = rest[..eq].replace('_', ".");
+                prefs.sync_map.insert(addr, PathBuf::from(&rest[eq + 1..]));
             }
         }
-        if let Some(v) = line.strip_prefix("save_dir=") {
-            prefs.save_dir = Some(PathBuf::from(v));
+        if let Some(v) = line.strip_prefix("save_dir=")           { prefs.save_dir = Some(PathBuf::from(v)); }
+        if let Some(v) = line.strip_prefix("notify_on_receive=")  { prefs.notify_on_receive = v == "1"; }
+        if let Some(v) = line.strip_prefix("auto_open_folder=")   { prefs.auto_open_folder  = v == "1"; }
+        if let Some(rest) = line.strip_prefix("manual_peer_") {
+            if let Some(idx_end) = rest.find('_') {
+                if let Ok(idx) = rest[..idx_end].parse::<usize>() {
+                    let suffix = &rest[idx_end + 1..];
+                    if let Some(v) = suffix.strip_prefix("name=") { mp_names.insert(idx, v.to_string()); }
+                    if let Some(v) = suffix.strip_prefix("addr=") { mp_addrs.insert(idx, v.to_string()); }
+                }
+            }
         }
-        if let Some(v) = line.strip_prefix("notify_on_receive=") {
-            prefs.notify_on_receive = v == "1";
-        }
-        if let Some(v) = line.strip_prefix("auto_open_folder=") {
-            prefs.auto_open_folder = v == "1";
-        }
+    }
+
+    let mut i = 0;
+    while let (Some(name), Some(addr)) = (mp_names.remove(&i), mp_addrs.remove(&i)) {
+        prefs.manual_peers.push((name, addr));
+        i += 1;
     }
     prefs
 }
@@ -164,6 +272,139 @@ fn is_newer(latest: &str, current: &str) -> bool {
               p.next()?.split('-').next()?.parse().ok()?))
     }
     matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
+}
+
+fn section_header(ui: &mut egui::Ui, p: &Pal, label: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.label(RichText::new(label).size(10.5).strong().color(p.text_faint));
+        ui.add_space(8.0);
+        let y = ui.cursor().top() + 7.0;
+        let x0 = ui.cursor().left();
+        let x1 = ui.max_rect().right() - 8.0;
+        ui.painter().line_segment(
+            [egui::pos2(x0, y), egui::pos2(x1, y)],
+            Stroke::new(1.0, tint(p.border, 80)),
+        );
+    });
+    ui.add_space(4.0);
+}
+
+fn device_row(
+    ui: &mut egui::Ui,
+    p: &Pal,
+    peer: &Peer,
+    selected: bool,
+    is_recent: bool,
+    is_remote: bool,
+) -> egui::Response {
+    let fill = if selected { tint(p.accent, 30) }
+               else        { Color32::TRANSPARENT };
+    let stroke = if selected { Stroke::new(1.0, tint(p.accent, 60)) }
+                 else        { Stroke::NONE };
+
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 44.0), Sense::click());
+
+    // Hover highlight
+    let bg = if resp.hovered() && !selected { tint(p.accent, 12) } else { fill };
+    ui.painter().rect(rect, CornerRadius::same(6), bg, stroke,
+        egui::StrokeKind::Inside);
+
+    let margin = 12.0f32;
+    let content = rect.shrink2(Vec2::new(margin, 0.0));
+
+    // ── Avatar circle ─────────────────────────────────────────────────────
+    let av_c = egui::pos2(content.left() + 16.0, content.center().y);
+    let av_col = if is_remote { p.accent2 }
+                 else if is_recent { p.accent }
+                 else { tint(p.accent, 180) };
+    ui.painter().circle_filled(av_c, 14.0, tint(av_col, 30));
+    ui.painter().text(av_c, egui::Align2::CENTER_CENTER,
+        &peer.name.chars().next().unwrap_or('?').to_uppercase().to_string(),
+        egui::FontId::proportional(14.0), av_col);
+
+    // ── Name + badges ─────────────────────────────────────────────────────
+    let name_x = content.left() + 40.0;
+    ui.painter().text(
+        egui::pos2(name_x, content.center().y - 7.0),
+        egui::Align2::LEFT_CENTER,
+        &peer.name,
+        egui::FontId::proportional(13.0),
+        if selected { p.accent } else { p.text });
+
+    // Recent star badge
+    if is_recent {
+        ui.painter().text(
+            egui::pos2(name_x + peer.name.len() as f32 * 7.5 + 6.0,
+                content.center().y - 7.0),
+            egui::Align2::LEFT_CENTER,
+            "★",
+            egui::FontId::proportional(10.0), p.warn);
+    }
+
+    // Subtitle: remote label or "Recently connected"
+    let sub = if is_remote { "Remote device".to_string() }
+              else if is_recent { "Recently connected".to_string() }
+              else { String::new() };
+    if !sub.is_empty() {
+        ui.painter().text(
+            egui::pos2(name_x, content.center().y + 8.0),
+            egui::Align2::LEFT_CENTER,
+            &sub,
+            egui::FontId::proportional(10.0),
+            p.text_faint);
+    }
+
+    // ── Right side columns ────────────────────────────────────────────────
+    // Address
+    let addr_str = peer.addr.to_string();
+    ui.painter().text(
+        egui::pos2(content.right() - 160.0, content.center().y),
+        egui::Align2::LEFT_CENTER,
+        &addr_str,
+        egui::FontId::proportional(11.0), p.text_dim);
+
+    // Latency
+    let lat_str = match peer.latency {
+        Some(ms) => format!("{} ms", ms),
+        None     => "—".to_string(),
+    };
+    let lat_col = match peer.latency {
+        Some(ms) if ms < 10  => p.success,
+        Some(ms) if ms < 50  => p.warn,
+        Some(_)              => p.danger,
+        None                 => p.text_faint,
+    };
+    ui.painter().text(
+        egui::pos2(content.right() - 75.0, content.center().y),
+        egui::Align2::LEFT_CENTER,
+        &lat_str,
+        egui::FontId::proportional(11.0), lat_col);
+
+    // Type badge
+    let (type_lbl, type_col) = if is_remote {
+        ("Remote", p.accent2)
+    } else {
+        ("Local", p.success)
+    };
+    let badge_rect = egui::Rect::from_center_size(
+        egui::pos2(content.right() - 18.0, content.center().y),
+        Vec2::new(40.0, 16.0));
+    ui.painter().rect_filled(badge_rect, 4.0, tint(type_col, 25));
+    ui.painter().text(badge_rect.center(), egui::Align2::CENTER_CENTER,
+        type_lbl, egui::FontId::proportional(9.0), type_col);
+
+    // Selected checkmark
+    if selected {
+        ui.painter().text(
+            egui::pos2(content.left() - 4.0, content.center().y),
+            egui::Align2::LEFT_CENTER,
+            icons::ICON_CHECK,
+            egui::FontId::proportional(13.0), p.accent);
+    }
+
+    resp
 }
 
 // ─── License ─────────────────────────────────────────────────────────────────
@@ -477,16 +718,26 @@ impl QueueItem {
         matches!(self.progress, Some(p) if p >= 0.0 && p < 1.0) && self.error.is_none()
     }
 }
+
 #[derive(Debug)]
 enum QueueMsg {
     Progress { index: usize, progress: f32 },
     Done { index: usize },
     Failed { index: usize, error: String },
 }
+
+#[derive(Clone, Debug, PartialEq)]
+enum PeerKind {
+    Local,   // discovered via UDP broadcast
+    Remote,  // manually added by IP/hostname
+}
+
 #[derive(Clone, Debug)]
 struct Peer {
-    name: String,
-    addr: std::net::IpAddr,
+    name:    String,
+    addr:    std::net::IpAddr,
+    kind:    PeerKind,
+    latency: Option<u32>,   // ms, from ping probe
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -531,6 +782,18 @@ struct RecvState {
     notify_on_receive: bool,
     auto_open_folder:  bool,
     save_dir:          Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ScanMode { Local, Remote }
+
+#[derive(Clone, Debug, PartialEq)]
+enum RelayState {
+    Offline,
+    Connecting,
+    Online { code: String },
+    Paired  { peer_name: String },
+    Error   (String),
 }
 
 // ─── App ─────────────────────────────────────────────────────────────────────
@@ -586,6 +849,26 @@ pub struct App {
     // ── Update checker ────────────────────────────────────────────────────
     update_available: Option<String>,
     update_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+
+    // Remote peer entry
+    remote_ip_buf:   String,   // text field contents
+    remote_name_buf: String,
+    remote_msg:      Option<(String, bool)>,  // (message, is_error)
+
+    // Persisted manual peers (survive restarts)
+    manual_peers: Vec<Peer>,
+    latency_rx: Option<std::sync::mpsc::Receiver<(std::net::IpAddr, u32)>>,
+    scan_mode:  ScanMode,
+    relay_state: RelayState,
+    relay_rx:   Option<std::sync::mpsc::Receiver<RelayMsg>>,
+    relay_code_input: String,   // sender: code entry field
+}
+
+enum RelayMsg {
+    Code(String),
+    Paired { peer: String },
+    Ready(Arc<Mutex<Option<TcpStream>>>),
+    Error(String),
 }
 
 impl Default for App {
@@ -647,6 +930,20 @@ impl Default for App {
             update_available: None,
             update_rx: None,
             license,
+            remote_ip_buf:   String::new(),
+            remote_name_buf: String::new(),
+            remote_msg:      None,
+            manual_peers: prefs.manual_peers.iter().filter_map(|(name, addr_str)| {
+                addr_str.parse::<std::net::IpAddr>().ok().map(|addr| Peer {
+                    name: name.clone(), addr,
+                    kind: PeerKind::Remote, latency: None,
+                })
+            }).collect(),
+            latency_rx: None,
+            scan_mode:        ScanMode::Local,
+            relay_state:      RelayState::Offline,
+            relay_rx:         None,
+            relay_code_input: String::new(),
         }
     }
 }
@@ -659,6 +956,7 @@ impl App {
             Pal::light()
         }
     }
+
     fn is_pro(&self) -> bool {
         self.license.is_pro()
     }
@@ -683,8 +981,12 @@ impl App {
         let (name, addr) = self.selected_peer()
             .map(|p| (p.name.as_str(), p.addr.to_string()))
             .unwrap_or((&self.saved_peer_name, self.saved_peer_addr.clone()));
+        let manual: Vec<(String, String)> = self.manual_peers.iter()
+            .map(|p| (p.name.clone(), p.addr.to_string()))
+            .collect();
         save_prefs(name, &addr, &self.sync_map,
-            Some(&self.save_dir), self.notify_on_receive, self.auto_open_folder);
+            Some(&self.save_dir), self.notify_on_receive,
+            self.auto_open_folder, &manual);
     }
 
     fn start_scan(&mut self) {
@@ -715,7 +1017,7 @@ impl App {
                             let name = name.trim().to_string();
                             let ip = addr.ip();
                             if !found.iter().any(|p| p.addr == ip) {
-                                found.push(Peer { name, addr: ip });
+                                found.push(Peer { name, addr: ip, kind: PeerKind::Local, latency: None });
                             }
                         }
                     }
@@ -732,14 +1034,17 @@ impl App {
             }
         }
     }
+
     fn remove_queue_item(&mut self, idx: usize) {
         if idx < self.queue.len() {
             self.queue.remove(idx);
         }
     }
+
     fn clear_done(&mut self) {
         self.queue.retain(|q| !q.is_done() && !q.is_failed());
     }
+
     fn retry_failed(&mut self) {
         for item in &mut self.queue {
             if item.is_failed() {
@@ -978,6 +1283,14 @@ impl App {
                         !local_ips.contains(&p.addr.to_string()) && p.name != self.this_hostname
                     })
                     .collect();
+
+                // Append persisted manual peers so they always appear in the list
+                for mp in &self.manual_peers {
+                    if !self.peers.iter().any(|p| p.addr == mp.addr) {
+                        self.peers.push(mp.clone());
+                    }
+                }
+
                 self.scan_state = ScanState::Done;
                 if self.selected.is_some() {
                     self.rebuild_sync_jobs();
@@ -1071,6 +1384,75 @@ impl App {
                 self.update_available = v;
                 self.update_rx = None;
             }
+        }
+
+        if let Some(rx) = &self.latency_rx {
+            while let Ok((addr, ms)) = rx.try_recv() {
+                if let Some(p) = self.peers.iter_mut().find(|p| p.addr == addr) {
+                    p.latency = Some(ms);
+                }
+            }
+        }
+
+        // Take the receiver out to process its messages.
+        // This sets `self.relay_rx` to `None` for the duration of this block,
+        // resolving the borrow error when we eventually assign to it or don't put it back.
+        if let Some(rx) = self.relay_rx.take() {
+            let mut keep_channel_active = true;
+            loop {
+                match rx.try_recv() {
+                    Ok(RelayMsg::Code(code)) => {
+                        self.relay_state = RelayState::Online { code };
+                    }
+                    Ok(RelayMsg::Paired { peer }) => {
+                        self.relay_state = RelayState::Paired { peer_name: peer };
+                    }
+                    Ok(RelayMsg::Ready(stream_holder)) => {
+                        // Inject the relay stream as a virtual peer
+                        // The relay stream behaves like a TcpStream for the transfer protocol
+                        if let RelayState::Paired { ref peer_name } = self.relay_state.clone() {
+                            // Parse a dummy IP for the relay peer
+                            let dummy_ip: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+                            let relay_peer = Peer {
+                                name:    peer_name.clone(),
+                                addr:    dummy_ip,
+                                kind:    PeerKind::Remote,
+                                latency: None,
+                            };
+                            // Add to peers and auto-select
+                            if !self.peers.iter().any(|p| p.addr == dummy_ip) {
+                                self.peers.push(relay_peer.clone());
+                            }
+                            let idx = self.peers.iter().position(|p| p.addr == dummy_ip).unwrap();
+                            self.selected = Some(idx);
+                            self.saved_peer_name = peer_name.clone();
+                            self.saved_peer_addr = dummy_ip.to_string();
+                            self.tab = Tab::Send;
+                        }
+                        keep_channel_active = false;
+                        break;
+                    }
+                    Ok(RelayMsg::Error(e)) => {
+                        self.relay_state = RelayState::Error(e);
+                        keep_channel_active = false;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // No messages for now, keep the channel active for next poll
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Channel disconnected, do not keep it active
+                        keep_channel_active = false;
+                        break;
+                    }
+                }
+            }
+            if keep_channel_active {
+                // Put the receiver back if it's still considered active
+                self.relay_rx = Some(rx);
+            }
+            // If not active, self.relay_rx remains None as it was taken initially.
         }
     }
 
@@ -1217,6 +1599,144 @@ impl App {
                     });
                 });
             });
+    }
+
+    fn try_connect_remote(&mut self) {
+        let raw = self.remote_ip_buf.trim().to_string();
+        if raw.is_empty() {
+            self.remote_msg = Some(("Enter an IP address or hostname".into(), true));
+            return;
+        }
+        // Resolve hostname → IP
+        let addr: std::net::IpAddr = match raw.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                // Try DNS resolution
+                match std::net::ToSocketAddrs::to_socket_addrs(
+                    &format!("{}:{}", raw, TRANSFER_PORT)) {
+                    Ok(mut addrs) => match addrs.next() {
+                        Some(sa) => sa.ip(),
+                        None => {
+                            self.remote_msg = Some((
+                                format!("Could not resolve '{}'", raw), true));
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        self.remote_msg = Some((format!("DNS error: {}", e), true));
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Quick TCP probe to check reachability
+        let reachable = std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::new(addr, TRANSFER_PORT),
+            std::time::Duration::from_secs(3)
+        ).is_ok();
+
+        if !reachable {
+            self.remote_msg = Some((
+                format!("{}:{} is not reachable — check IP and firewall",
+                    addr, TRANSFER_PORT), true));
+            return;
+        }
+
+        let name = if self.remote_name_buf.trim().is_empty() {
+            raw.clone()
+        } else {
+            self.remote_name_buf.trim().to_string()
+        };
+
+        let peer = Peer { name: name.clone(), addr,
+            kind: PeerKind::Remote, latency: None };
+
+        // Add to manual peers if not already there
+        if !self.manual_peers.iter().any(|p| p.addr == addr) {
+            self.manual_peers.push(peer.clone());
+            self.persist_prefs();
+        }
+        // Select it
+        if let Some(idx) = self.peers.iter().position(|p| p.addr == addr) {
+            self.selected = Some(idx);
+        } else {
+            self.peers.push(peer);
+            self.selected = Some(self.peers.len() - 1);
+        }
+        self.saved_peer_name = name;
+        self.saved_peer_addr = addr.to_string();
+        self.rebuild_sync_jobs();
+        self.persist_prefs();
+        self.remote_msg = Some(("Connected!".into(), false));
+        self.tab = Tab::Send;
+    }
+
+    fn remove_manual_peer(&mut self, addr: std::net::IpAddr) {
+        self.manual_peers.retain(|p| p.addr != addr);
+        if self.selected_peer().map(|p| p.addr) == Some(addr) {
+            self.selected = None;
+        }
+        self.peers.retain(|p| !(p.addr == addr && p.kind == PeerKind::Remote));
+        self.persist_prefs();
+    }
+
+    fn probe_latencies(&mut self) {
+        if self.peers.is_empty() { return; }
+        let peers: Vec<(std::net::IpAddr,)> = self.peers.iter()
+            .map(|p| (p.addr,)).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.latency_rx = Some(rx);
+        thread::spawn(move || {
+            for (addr,) in peers {
+                let start = std::time::Instant::now();
+                let ok = std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::new(addr, TRANSFER_PORT),
+                    std::time::Duration::from_millis(500)).is_ok();
+                if ok {
+                    let ms = start.elapsed().as_millis() as u32;
+                    let _ = tx.send((addr, ms));
+                }
+            }
+        });
+    }
+
+    fn select_peer(&mut self, peer_idx: usize, peer: &Peer) {
+        let was_selected = self.selected == Some(peer_idx);
+        self.selected = if was_selected { None } else { Some(peer_idx) };
+        if self.selected.is_some() {
+            self.saved_peer_name = peer.name.clone();
+            self.saved_peer_addr = peer.addr.to_string();
+            self.rebuild_sync_jobs();
+            self.persist_prefs();
+        } else {
+            self.rebuild_sync_jobs();
+        }
+    }
+
+    fn go_online(&mut self) {
+        if self.relay_state != RelayState::Offline { return; }
+        self.relay_state = RelayState::Connecting;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.relay_rx = Some(rx);
+        thread::spawn(move || relay_listen(tx));
+    }
+
+    fn go_offline(&mut self) {
+        self.relay_state = RelayState::Offline;
+        self.relay_rx = None;
+    }
+
+    fn connect_via_relay(&mut self) {
+        let code = self.relay_code_input.trim().to_uppercase().replace(' ', "");
+        if code.len() < 8 {
+            self.remote_msg = Some(("Enter the 8-character code".into(), true));
+            return;
+        }
+        self.relay_state = RelayState::Connecting;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.relay_rx = Some(rx);
+        thread::spawn(move || relay_connect(&code, tx));
     }
 }
 
@@ -1601,191 +2121,526 @@ impl eframe::App for App {
     }
 }
 
-// ─── Scan tab ────────────────────────────────────────────────────────────────
+// ─── Send tab ────────────────────────────────────────────────────────────────
 impl App {
-    fn show_scan(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, wide: bool) {
+    fn show_scan(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, _wide: bool) {
         let p = self.p();
-        let avail_w = ui.available_width();
-        let col_w = if wide {
-            (avail_w - 64.0).min(580.0)
-        } else {
-            avail_w - 32.0
-        };
-        let x_pad = (avail_w - col_w) / 2.0;
         let scanning = self.scan_state == ScanState::Scanning;
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                ui.add_space(x_pad);
-                ui.vertical(|ui| {
-                    ui.set_width(col_w);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if self.scan_state != ScanState::Idle && !scanning {
-                                if ui.add(egui::Button::new(
-                                    RichText::new(format!("  {}  ", "Rescan")).size(13.0).strong().color(Color32::WHITE))
-                                    .fill(p.accent).corner_radius(8.0)
-                                    .min_size(Vec2::new(80.0, 32.0))).clicked()
-                                {
-                                    self.start_scan();
-                                }
-                                ui.add_space(8.0);
-                                egui::Frame::new()
-                                    .fill(p.surface2)
-                                    .stroke(Stroke::new(1.0, if !self.scan_filter.is_empty() { p.accent } else { p.border }))
-                                    .corner_radius(8.0)
-                                    .inner_margin(egui::Margin { left: 10, right: 10, top: 6, bottom: 6 })
-                                    .show(ui, |ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        ui.horizontal(|ui| {
-                                            ui.label(RichText::new(icons::ICON_SEARCH).size(14.0).color(p.text_dim));
-                                            ui.add_space(6.0);
-                                            ui.add(egui::TextEdit::singleline(&mut self.scan_filter)
-                                                .hint_text("Search by name or IP…")
-                                                .desired_width(ui.available_width() - 33.0)
-                                                .frame(false));
-                                            if !self.scan_filter.is_empty() {
-                                                if ui.add(egui::Button::new(
-                                                    RichText::new(icons::ICON_CLOSE).size(12.0).color(p.text_dim))
-                                                    .frame(false)).clicked()
-                                                {
-                                                    self.scan_filter.clear();
-                                                }
-                                            }
-                                        });
-                                    });
-                            }
-                        });
-                    });
-                    ui.add_space(12.0);
+        // ── Toolbar ───────────────────────────────────────────────────────
+        egui::Frame::new()
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0, p.border))
+            .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
 
-                    if self.scan_state == ScanState::Idle {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(24.0);
-                            radar_graphic(ui, &p, self.scan_pulse, false);
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("Scan your network to find devices running rfshare")
-                                .size(12.0).color(p.text_dim));
-                            ui.add_space(16.0);
-                            if ui.add(big_btn("  Scan for Devices  ", p.accent)).clicked() {
-                                self.start_scan();
-                            }
-                        });
-                        ui.add_space(24.0);
-                    }
-
-                    if self.scan_state == ScanState::Scanning {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(24.0);
-                            radar_graphic(ui, &p, self.scan_pulse, true);
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("Looking for devices on your network…")
-                                .size(12.0).color(p.text_dim));
-                            ui.add_space(24.0);
-                        });
-                        ctx.request_repaint_after(std::time::Duration::from_millis(40));
-                    }
-
-                    if self.scan_state == ScanState::Done {
-                        let filter = self.scan_filter.to_lowercase();
-
-                        let peers = self.peers.clone();
-                        let (mut recent, mut others): (Vec<_>, Vec<_>) = peers.iter()
-                            .enumerate()
-                            .partition(|(_, p)| p.addr.to_string() == self.saved_peer_addr);
-                        others.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
-                        let ordered: Vec<(usize, &Peer)> = recent.drain(..).chain(others.drain(..)).collect();
-
-                        let visible: Vec<(usize, &Peer)> = ordered.into_iter()
-                            .filter(|(_, peer)| filter.is_empty()
-                                || peer.name.to_lowercase().contains(&filter)
-                                || peer.addr.to_string().contains(&filter))
-                            .collect();
-
-                        if visible.is_empty() {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(20.0);
-                                if !filter.is_empty() {
-                                    ui.label(RichText::new("No devices match your search")
-                                        .size(13.0).color(p.text_dim));
-                                } else {
-                                    ui.label(RichText::new("No devices found on this network")
-                                        .strong().size(13.0).color(p.text));
-                                    ui.add_space(4.0);
-                                    ui.label(RichText::new("Ensure the other device is running rfshare on the same Wi-Fi")
-                                        .size(11.0).color(p.text_dim));
-                                }
-                                ui.add_space(20.0);
-                            });
+                    // ── Local / Remote toggle ─────────────────────────────
+                    for (label, mode) in [
+                        ("  Local  ", ScanMode::Local),
+                        ("  Remote  ", ScanMode::Remote),
+                    ] {
+                        let active = self.scan_mode == mode;
+                        let (fill, text_col) = if active {
+                            (p.accent, Color32::WHITE)
                         } else {
-                            let first_is_recent = !self.saved_peer_addr.is_empty()
-                                && visible.first().map(|(_, p)| p.addr.to_string() == self.saved_peer_addr)
-                                .unwrap_or(false);
-
-                            for (list_idx, (peer_idx, peer)) in visible.iter().enumerate() {
-                                let is_recent = peer.addr.to_string() == self.saved_peer_addr;
-                                let sel = self.selected == Some(*peer_idx);
-
-                                if list_idx == 0 && first_is_recent {
-                                    ui.label(RichText::new("Recently connected")
-                                        .size(11.0).strong().color(p.text_faint));
-                                    ui.add_space(4.0);
-                                } else if list_idx == 1 && first_is_recent {
-                                    ui.add_space(6.0);
-                                    ui.label(RichText::new("Other devices")
-                                        .size(11.0).strong().color(p.text_faint));
-                                    ui.add_space(4.0);
-                                } else if list_idx == 0 && !first_is_recent && !visible.is_empty() {
-                                    ui.label(RichText::new("Available devices")
-                                        .size(11.0).strong().color(p.text_faint));
-                                    ui.add_space(4.0);
-                                }
-
-                                if scan_peer_row(ui, &p, peer, sel, is_recent).clicked() {
-                                    self.selected = if sel { None } else { Some(*peer_idx) };
-                                    if self.selected.is_some() {
-                                        self.saved_peer_name = peer.name.clone();
-                                        self.saved_peer_addr = peer.addr.to_string();
-                                        self.rebuild_sync_jobs();
-                                        self.persist_prefs();
-                                        self.tab = Tab::Send;
-                                    } else {
-                                        self.rebuild_sync_jobs();
-                                    }
-                                }
-                                ui.add_space(6.0);
-                            }
+                            (p.surface2, p.text_dim)
+                        };
+                        if ui.add(egui::Button::new(
+                            RichText::new(label).size(12.0).color(text_col))
+                            .fill(fill)
+                            .corner_radius(6.0)
+                            .min_size(Vec2::new(0.0, 30.0))).clicked()
+                        {
+                            self.scan_mode = mode;
                         }
                     }
 
-                    if self.scan_state == ScanState::Done
-                        && !self.saved_peer_name.is_empty()
-                        && !self.peers.iter().any(|p| p.addr.to_string() == self.saved_peer_addr)
-                    {
+                    ui.add_space(8.0);
+
+                    // Local mode: scan button + filter
+                    if self.scan_mode == ScanMode::Local {
+                        let scan_lbl = if scanning {
+                            format!("{}  Scanning…", icons::ICON_SYNC)
+                        } else {
+                            format!("{}  Scan", icons::ICON_SEARCH)
+                        };
+                        ui.add_enabled_ui(!scanning, |ui| {
+                            if ui.add(egui::Button::new(
+                                RichText::new(&scan_lbl).size(12.0).color(Color32::WHITE))
+                                .fill(p.surface2).corner_radius(6.0)
+                                .stroke(Stroke::new(1.0, p.border))
+                                .min_size(Vec2::new(80.0, 30.0))).clicked()
+                            {
+                                self.start_scan();
+                            }
+                        });
                         ui.add_space(8.0);
                         egui::Frame::new()
-                            .fill(tint(p.danger, 10))
-                            .stroke(Stroke::new(1.0, tint(p.danger, 40))).corner_radius(8.0)
-                            .inner_margin(egui::Margin::same(10))
+                            .fill(p.bg)
+                            .stroke(Stroke::new(1.0,
+                                if !self.scan_filter.is_empty() { p.accent } else { p.border }))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 5 })
                             .show(ui, |ui| {
+                                ui.set_min_width(160.0);
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(icons::ICON_DEVICES.to_string()).size(11.0).color(p.danger));
-                                    ui.add_space(6.0);
-                                    ui.label(RichText::new(format!("{} — not available on this network",
-                                        self.saved_peer_name)).size(11.5).color(p.danger));
+                                    ui.label(RichText::new(icons::ICON_SEARCH)
+                                        .size(13.0).color(p.text_faint));
+                                    ui.add_space(4.0);
+                                    ui.add(egui::TextEdit::singleline(&mut self.scan_filter)
+                                        .hint_text("Filter…")
+                                        .desired_width(110.0)
+                                        .frame(false));
+                                    if !self.scan_filter.is_empty() {
+                                        if ui.add(egui::Button::new(
+                                            RichText::new(icons::ICON_CLOSE).size(11.0)
+                                            .color(p.text_faint)).frame(false)).clicked()
+                                        {
+                                            self.scan_filter.clear();
+                                        }
+                                    }
                                 });
                             });
+                        if self.scan_state == ScanState::Done {
+                            ui.add_space(8.0);
+                            let n = self.peers.iter()
+                                .filter(|p| p.kind == PeerKind::Local).count();
+                            ui.label(RichText::new(format!(
+                                "{} device{}", n, if n == 1 {""} else {"s"}))
+                                .size(11.0).color(p.text_faint));
+                        }
                     }
+
+                    // Remote mode: online status indicator
+                    if self.scan_mode == ScanMode::Remote {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match &self.relay_state {
+                                RelayState::Online { .. } | RelayState::Paired { .. } => {
+                                    if ui.add(pill_btn("Go Offline", p.danger)).clicked() {
+                                        self.go_offline();
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.painter().circle_filled(
+                                        ui.cursor().left_top() + Vec2::new(4.0, 10.0),
+                                        5.0, p.success);
+                                    ui.add_space(14.0);
+                                    ui.label(RichText::new("Online").size(11.5)
+                                        .color(p.success).strong());
+                                }
+                                RelayState::Connecting => {
+                                    ui.spinner();
+                                    ui.add_space(6.0);
+                                    ui.label(RichText::new("Connecting…")
+                                        .size(11.5).color(p.text_dim));
+                                }
+                                _ => {
+                                    if ui.add(egui::Button::new(
+                                        RichText::new("  Go Online  ").size(12.0)
+                                        .color(Color32::WHITE))
+                                        .fill(p.success).corner_radius(6.0)
+                                        .min_size(Vec2::new(0.0, 30.0))).clicked()
+                                    {
+                                        self.go_online();
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.painter().circle_filled(
+                                        ui.cursor().left_top() + Vec2::new(4.0, 10.0),
+                                        5.0, p.text_faint);
+                                    ui.add_space(14.0);
+                                    ui.label(RichText::new("Offline").size(11.5)
+                                        .color(p.text_faint));
+                                }
+                            }
+                        });
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if scanning && self.scan_mode == ScanMode::Local {
+                            ui.spinner();
+                            ctx.request_repaint_after(std::time::Duration::from_millis(40));
+                        }
+                    });
                 });
             });
-            ui.add_space(24.0);
-        });
-    }
-}
 
-// ─── Send tab ────────────────────────────────────────────────────────────────
-impl App {
+        // ── Content ───────────────────────────────────────────────────────
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+
+                match self.scan_mode {
+                    ScanMode::Local => self.show_local_scan(ui, ctx),
+                    ScanMode::Remote => self.show_remote_panel(ui, ctx),
+                }
+            });
+    }
+
+    // ── Local scan content ────────────────────────────────────────────────
+    fn show_local_scan(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = self.p();
+        let scanning = self.scan_state == ScanState::Scanning;
+
+        if self.scan_state == ScanState::Idle {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                radar_graphic(ui, &p, self.scan_pulse, false);
+                ui.add_space(16.0);
+                ui.label(RichText::new("Find devices on your network")
+                    .size(14.0).strong().color(p.text));
+                ui.add_space(6.0);
+                ui.label(RichText::new(
+                    "Devices running rfshare on the same Wi-Fi will appear here.")
+                    .size(12.0).color(p.text_dim));
+                ui.add_space(20.0);
+                if ui.add(big_btn(&format!("  {}  Scan  ", icons::ICON_SEARCH), p.accent))
+                    .clicked() { self.start_scan(); }
+            });
+            ui.add_space(32.0);
+        }
+
+        if scanning {
+            ui.add_space(32.0);
+            ui.vertical_centered(|ui| {
+                radar_graphic(ui, &p, self.scan_pulse, true);
+                ui.add_space(14.0);
+                ui.label(RichText::new("Scanning your network…")
+                    .size(13.0).color(p.text_dim));
+            });
+            ui.add_space(32.0);
+            ctx.request_repaint_after(std::time::Duration::from_millis(40));
+        }
+
+        if self.scan_state == ScanState::Done {
+            let filter = self.scan_filter.to_lowercase();
+            let all_peers = self.peers.clone();
+            let local_peers: Vec<(usize, &Peer)> = {
+                let tmp: Vec<_> = all_peers.iter().enumerate()
+                    .filter(|(_, p)| p.kind == PeerKind::Local)
+                    .collect();
+                let mut sorted: Vec<(usize, &Peer)> = tmp.into_iter().map(|(i,p)|(i,p)).collect();
+                sorted.sort_by(|(_, a), (_, b)| {
+                    let a_rec = a.addr.to_string() == self.saved_peer_addr;
+                    let b_rec = b.addr.to_string() == self.saved_peer_addr;
+                    b_rec.cmp(&a_rec).then(a.name.cmp(&b.name))
+                });
+                sorted
+            };
+
+            let filtered: Vec<(usize, &Peer)> = local_peers.iter()
+                .filter(|(_, p)| filter.is_empty()
+                    || p.name.to_lowercase().contains(&filter)
+                    || p.addr.to_string().contains(&filter))
+                .map(|(i, p)| (*i, *p))
+                .collect();
+
+            // Column headers
+            egui::Frame::new()
+                .fill(p.surface2)
+                .inner_margin(egui::Margin { left:16, right:16, top:4, bottom:4 })
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Name").size(10.5).strong().color(p.text_faint));
+                        ui.add_space(ui.available_width() - 180.0);
+                        ui.label(RichText::new("Address").size(10.5).strong().color(p.text_faint));
+                        ui.add_space(16.0);
+                        ui.label(RichText::new("Latency").size(10.5).strong().color(p.text_faint));
+                        ui.add_space(16.0);
+                        ui.label(RichText::new("Type").size(10.5).strong().color(p.text_faint));
+                    });
+                });
+            ui.add_space(4.0);
+
+            if !filtered.is_empty() {
+                for (peer_idx, peer) in &filtered {
+                    let is_recent = peer.addr.to_string() == self.saved_peer_addr;
+                    let sel = self.selected == Some(*peer_idx);
+                    let resp = device_row(ui, &p, peer, sel, is_recent, false);
+                    if resp.clicked() { self.select_peer(*peer_idx, peer); }
+                    if resp.double_clicked() {
+                        self.select_peer(*peer_idx, peer);
+                        self.tab = Tab::Send;
+                    }
+                }
+            } else {
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("📡").size(40.0));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("No devices found")
+                        .size(14.0).strong().color(p.text));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(
+                        "Make sure the other device is on the same Wi-Fi and running rfshare")
+                        .size(11.5).color(p.text_dim));
+                    ui.add_space(12.0);
+                    if ui.add(pill_btn("Scan again", p.accent)).clicked() {
+                        self.start_scan();
+                    }
+                });
+            }
+
+            // Offline banner
+            if !self.saved_peer_name.is_empty()
+                && !self.peers.iter().any(|p|
+                    p.addr.to_string() == self.saved_peer_addr
+                    && p.kind == PeerKind::Local)
+            {
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(tint(p.warn, 8))
+                    .stroke(Stroke::new(1.0, tint(p.warn, 35)))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin { left:12, right:12, top:8, bottom:8 })
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("⚠").size(14.0).color(p.warn));
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(format!(
+                                "{}  ·  {}  not on this network",
+                                self.saved_peer_name, self.saved_peer_addr))
+                                .size(11.5).color(p.warn));
+                        });
+                    });
+            }
+        }
+    }
+
+    // ── Remote panel ──────────────────────────────────────────────────────
+    fn show_remote_panel(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        let p = self.p();
+
+        ui.add_space(12.0);
+
+        match self.relay_state.clone() {
+
+            // ── Offline ───────────────────────────────────────────────────
+            RelayState::Offline | RelayState::Error(_) => {
+                if let RelayState::Error(ref e) = self.relay_state {
+                    egui::Frame::new()
+                        .fill(tint(p.danger, 10))
+                        .stroke(Stroke::new(1.0, tint(p.danger, 40)))
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("✗").size(13.0).color(p.danger));
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(e).size(11.5).color(p.danger));
+                            });
+                        });
+                    ui.add_space(12.0);
+                }
+
+                // How it works info box
+                egui::Frame::new()
+                    .fill(p.surface2)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(RichText::new("Share files over the internet")
+                            .size(13.0).strong().color(p.text));
+                        ui.add_space(8.0);
+                        for (icon, text) in [
+                            ("📱", "Receiver clicks  Go Online  → gets a code"),
+                            ("💬", "Receiver shares the code with the sender"),
+                            ("🔗", "Sender enters the code and connects"),
+                            ("🔒", "Files transfer end-to-end encrypted via relay"),
+                        ] {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(icon).size(14.0));
+                                ui.add_space(8.0);
+                                ui.label(RichText::new(text).size(12.0).color(p.text_dim));
+                            });
+                            ui.add_space(4.0);
+                        }
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(
+                            "No port forwarding needed. The relay only sees encrypted data.")
+                            .size(10.5).color(p.text_faint));
+                    });
+
+                ui.add_space(16.0);
+
+                // Two action cards side by side
+                let avail = ui.available_width();
+                let card_w = (avail - 12.0) / 2.0;
+                ui.horizontal(|ui| {
+                    // Receive card
+                    egui::Frame::new()
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.0, p.border))
+                        .corner_radius(10.0)
+                        .inner_margin(egui::Margin::same(14))
+                        .show(ui, |ui| {
+                            ui.set_min_width(card_w);
+                            ui.set_max_width(card_w);
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("📥").size(28.0));
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("Receive files")
+                                    .size(13.0).strong().color(p.text));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Go online to get a share code")
+                                    .size(11.0).color(p.text_dim));
+                                ui.add_space(10.0);
+                                if ui.add(egui::Button::new(
+                                    RichText::new("  Go Online  ").size(12.5)
+                                    .color(Color32::WHITE))
+                                    .fill(p.success).corner_radius(8.0)
+                                    .min_size(Vec2::new(ui.available_width(), 36.0))).clicked()
+                                {
+                                    self.go_online();
+                                }
+                            });
+                        });
+
+                    ui.add_space(12.0);
+
+                    // Send card
+                    egui::Frame::new()
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.0, p.border))
+                        .corner_radius(10.0)
+                        .inner_margin(egui::Margin::same(14))
+                        .show(ui, |ui| {
+                            ui.set_min_width(card_w);
+                            ui.set_max_width(card_w);
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("📤").size(28.0));
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("Send files")
+                                    .size(13.0).strong().color(p.text));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Enter the code from the receiver")
+                                    .size(11.0).color(p.text_dim));
+                                ui.add_space(10.0);
+                                egui::Frame::new()
+                                    .fill(p.bg)
+                                    .stroke(Stroke::new(1.0, p.border))
+                                    .corner_radius(6.0)
+                                    .inner_margin(egui::Margin { left:8, right:8, top:6, bottom:6 })
+                                    .show(ui, |ui| {
+                                        ui.add(egui::TextEdit::singleline(
+                                            &mut self.relay_code_input)
+                                            .hint_text("XXXX-XXXX")
+                                            .desired_width(f32::INFINITY)
+                                            .frame(false));
+                                    });
+                                ui.add_space(6.0);
+                                let can = self.relay_code_input.trim().len() >= 8;
+                                ui.add_enabled_ui(can, |ui| {
+                                    if ui.add(egui::Button::new(
+                                        RichText::new("  Connect  ").size(12.5)
+                                        .color(Color32::WHITE))
+                                        .fill(if can { p.accent } else { p.text_faint })
+                                        .corner_radius(8.0)
+                                        .min_size(Vec2::new(ui.available_width(), 36.0))).clicked()
+                                        || (ui.input(|i| i.key_pressed(egui::Key::Enter)) && can)
+                                    {
+                                        self.connect_via_relay();
+                                    }
+                                });
+                            });
+                        });
+                });
+
+                if let Some((ref msg, is_err)) = self.remote_msg {
+                    ui.add_space(8.0);
+                    let col = if is_err { p.danger } else { p.success };
+                    ui.label(RichText::new(msg).size(11.0).color(col));
+                }
+            }
+
+            // ── Connecting ────────────────────────────────────────────────
+            RelayState::Connecting => {
+                ui.add_space(60.0);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Connecting to relay…")
+                        .size(13.0).color(p.text_dim));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("This only takes a moment")
+                        .size(11.0).color(p.text_faint));
+                    ui.add_space(16.0);
+                    if ui.add(pill_btn("Cancel", p.danger)).clicked() {
+                        self.go_offline();
+                    }
+                });
+            }
+
+            // ── Online: receiver waiting with code ────────────────────────
+            RelayState::Online { ref code } => {
+                let code = code.clone();
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    // Status dot
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
+                        ui.painter().circle_filled(r.center(), 5.0, p.success);
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("You're online — waiting for sender…")
+                            .size(12.0).color(p.success));
+                    });
+                    ui.add_space(20.0);
+
+                    // Big code display
+                    ui.label(RichText::new("Your share code").size(12.0).color(p.text_dim));
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(tint(p.accent, 18))
+                        .stroke(Stroke::new(2.0, tint(p.accent, 60)))
+                        .corner_radius(12.0)
+                        .inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 16 })
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&code)
+                                .size(32.0).strong()
+                                .color(p.accent)
+                                .monospace());
+                        });
+
+                    ui.add_space(12.0);
+                    if ui.add(pill_btn("Copy code", p.accent)).clicked() {
+                        ui.ctx().copy_text(code.clone());
+                    }
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Share this code with the sender.")
+                        .size(11.0).color(p.text_dim));
+                    ui.label(RichText::new("Code expires when used or after 5 minutes.")
+                        .size(10.5).color(p.text_faint));
+                    ui.add_space(16.0);
+                    if ui.add(pill_btn("Cancel", p.danger)).clicked() {
+                        self.go_offline();
+                    }
+                });
+            }
+
+            // ── Paired ────────────────────────────────────────────────────
+            RelayState::Paired { ref peer_name } => {
+                let peer_name = peer_name.clone();
+                ui.add_space(60.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("✓").size(36.0).color(p.success));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(format!("Connected to {}", peer_name))
+                        .size(14.0).strong().color(p.text));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Switching to Send tab…")
+                        .size(11.0).color(p.text_dim));
+                });
+            }
+        }
+
+        ui.add_space(16.0);
+    }
+
     fn show_send(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, wide: bool) {
         let avail = ui.available_size();
         let pad = if wide { 28.0f32 } else { 16.0f32 };
@@ -2050,10 +2905,7 @@ impl App {
             }
         });
     }
-}
 
-// ─── History tab ─────────────────────────────────────────────────────────────
-impl App {
     fn show_history(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context, wide: bool) {
         let p = self.p();
         let avail_w = ui.available_width();
@@ -2223,133 +3075,7 @@ impl App {
                 ui.add_space(24.0);
             });
     }
-}
 
-fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
-    let file_exists = entry.file_exists();
-    let is_received = entry.direction == TransferDir::Received;
-
-    let (fill, border) = if !file_exists && is_received {
-        (tint(p.warn, 10), tint(p.warn, 45))
-    } else if !entry.success {
-        (tint(p.danger, 10), tint(p.danger, 50))
-    } else {
-        (p.surface, p.border)
-    };
-
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(Stroke::new(1.0, border))
-        .corner_radius(10.0)
-        .inner_margin(egui::Margin {
-            left: 12,
-            right: 12,
-            top: 10,
-            bottom: 10,
-        })
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-
-            let right_w = 88.0f32;
-            let total_w = ui.available_width();
-            let left_w = (total_w - right_w - 10.0).max(80.0);
-
-            ui.horizontal(|ui| {
-                let (dir_icon, dir_col) = if entry.direction == TransferDir::Sent {
-                    (icons::ICON_UPLOAD, p.accent)
-                } else {
-                    (icons::ICON_DOWNLOAD, p.success)
-                };
-                let (r, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
-                ui.painter()
-                    .circle_filled(r.center(), 15.0, tint(dir_col, 22));
-                ui.painter().text(
-                    r.center(),
-                    egui::Align2::CENTER_CENTER,
-                    dir_icon,
-                    egui::FontId::proportional(14.0),
-                    dir_col,
-                );
-
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.set_width(left_w - 52.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(truncate_filename(&entry.file_name, 32))
-                                .strong()
-                                .size(12.5)
-                                .color(p.text),
-                        );
-                        ui.add_space(4.0);
-                        if !entry.success {
-                            status_badge(ui, "FAILED", p.danger);
-                        }
-                        if !file_exists && is_received {
-                            status_badge(ui, "DELETED", p.warn);
-                        }
-                    });
-                    ui.add_space(2.0);
-                    let dir_word = if entry.direction == TransferDir::Sent {
-                        "to"
-                    } else {
-                        "from"
-                    };
-                    ui.label(
-                        RichText::new(format!(
-                            "{} {}  ·  {}",
-                            dir_word,
-                            entry.peer_name,
-                            format_size(entry.file_size)
-                        ))
-                        .size(11.0)
-                        .color(p.text_dim),
-                    );
-                    if let Some(ref fpath) = entry.file_path {
-                        let path_str = fpath.to_string_lossy();
-                        let display = if path_str.len() > 50 {
-                            format!("…{}", &path_str[path_str.len().saturating_sub(48)..])
-                        } else {
-                            path_str.to_string()
-                        };
-                        ui.label(RichText::new(display).size(10.0).color(p.text_faint));
-                    }
-                    if let Some(ref err) = entry.error {
-                        ui.label(
-                            RichText::new(truncate_filename(err, 50))
-                                .size(10.5)
-                                .color(p.danger),
-                        );
-                    }
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.set_width(right_w);
-                    ui.vertical(|ui| {
-                        ui.set_width(right_w);
-                        ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
-                            ui.label(
-                                RichText::new(entry.time_display())
-                                    .size(10.5)
-                                    .color(p.text_faint),
-                            );
-                            if is_received && file_exists {
-                                if let Some(ref fpath) = entry.file_path {
-                                    ui.add_space(4.0);
-                                    if ui.add(pill_btn("Open folder", p.accent)).clicked() {
-                                        open_folder(fpath);
-                                    }
-                                }
-                            }
-                        });
-                    });
-                });
-            });
-        });
-}
-
-// ─── Sync tab ─────────────────────────────────────────────────────────────────
-impl App {
     fn show_sync(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, wide: bool) {
         let p = self.p();
         let avail_w = ui.available_width();
@@ -2423,7 +3149,7 @@ impl App {
                             .and_then(|p| self.sync_map.get(&p.addr.to_string()))
                             .is_some();
                         let lbl = if has_folder { &format!("{}  Change folder", icons::ICON_FOLDER) }
-                                  else { &format!("{}  Set folder to watch", icons::ICON_FOLDER) };
+                                    else { &format!("{}  Set folder to watch", icons::ICON_FOLDER) };
                         if ui.add(pill_btn(lbl, p.accent)).clicked() {
                             if !self.is_pro() {
                                 self.show_upgrade = true;
@@ -2443,11 +3169,11 @@ impl App {
                         let sent_count = self.sync_jobs.first()
                             .map(|j| j.file_mtimes.len()).unwrap_or(0);
                         let border_col = if !folder_exists { tint(p.warn, 55) }
-                                         else if self.sync_active { tint(p.success, 55) }
-                                         else { p.border };
+                                            else if self.sync_active { tint(p.success, 55) }
+                                            else { p.border };
                         let fill_col   = if !folder_exists { tint(p.warn, 10) }
-                                         else if self.sync_active { tint(p.success, 8) }
-                                         else { p.surface };
+                                            else if self.sync_active { tint(p.success, 8) }
+                                            else { p.surface };
 
                         egui::Frame::new().fill(fill_col).stroke(Stroke::new(1.0, border_col))
                             .corner_radius(10.0)
@@ -2543,8 +3269,8 @@ impl App {
                                         ui.set_min_width(ui.available_width());
                                         for line in self.sync_log.iter().rev() {
                                             let col = if line.starts_with("OK") { p.success }
-                                                      else if line.starts_with("...") { p.text_dim }
-                                                      else { p.danger };
+                                                        else if line.starts_with("...") { p.text_dim }
+                                                        else { p.danger };
                                             ui.label(
                                                 RichText::new(line).size(11.0).color(col),
                                             );
@@ -2561,10 +3287,7 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
     }
-}
 
-// ─── Settings tab ─────────────────────────────────────────────────────────────
-impl App {
     fn show_settings(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context, wide: bool) {
         let p = self.p();
         let avail_w = ui.available_width();
@@ -2948,6 +3671,129 @@ impl App {
     }
 }
 
+fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
+    let file_exists = entry.file_exists();
+    let is_received = entry.direction == TransferDir::Received;
+
+    let (fill, border) = if !file_exists && is_received {
+        (tint(p.warn, 10), tint(p.warn, 45))
+    } else if !entry.success {
+        (tint(p.danger, 10), tint(p.danger, 50))
+    } else {
+        (p.surface, p.border)
+    };
+
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, border))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 12,
+            top: 10,
+            bottom: 10,
+        })
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            let right_w = 88.0f32;
+            let total_w = ui.available_width();
+            let left_w = (total_w - right_w - 10.0).max(80.0);
+
+            ui.horizontal(|ui| {
+                let (dir_icon, dir_col) = if entry.direction == TransferDir::Sent {
+                    (icons::ICON_UPLOAD, p.accent)
+                } else {
+                    (icons::ICON_DOWNLOAD, p.success)
+                };
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(r.center(), 15.0, tint(dir_col, 22));
+                ui.painter().text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    dir_icon,
+                    egui::FontId::proportional(14.0),
+                    dir_col,
+                );
+
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.set_width(left_w - 52.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(truncate_filename(&entry.file_name, 32))
+                                .strong()
+                                .size(12.5)
+                                .color(p.text),
+                        );
+                        ui.add_space(4.0);
+                        if !entry.success {
+                            status_badge(ui, "FAILED", p.danger);
+                        }
+                        if !file_exists && is_received {
+                            status_badge(ui, "DELETED", p.warn);
+                        }
+                    });
+                    ui.add_space(2.0);
+                    let dir_word = if entry.direction == TransferDir::Sent {
+                        "to"
+                    } else {
+                        "from"
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {}  ·  {}",
+                            dir_word,
+                            entry.peer_name,
+                            format_size(entry.file_size)
+                        ))
+                        .size(11.0)
+                        .color(p.text_dim),
+                    );
+                    if let Some(ref fpath) = entry.file_path {
+                        let path_str = fpath.to_string_lossy();
+                        let display = if path_str.len() > 50 {
+                            format!("…{}", &path_str[path_str.len().saturating_sub(48)..])
+                        } else {
+                            path_str.to_string()
+                        };
+                        ui.label(RichText::new(display).size(10.0).color(p.text_faint));
+                    }
+                    if let Some(ref err) = entry.error {
+                        ui.label(
+                            RichText::new(truncate_filename(err, 50))
+                                .size(10.5)
+                                .color(p.danger),
+                        );
+                    }
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.set_width(right_w);
+                    ui.vertical(|ui| {
+                        ui.set_width(right_w);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
+                            ui.label(
+                                RichText::new(entry.time_display())
+                                    .size(10.5)
+                                    .color(p.text_faint),
+                            );
+                            if is_received && file_exists {
+                                if let Some(ref fpath) = entry.file_path {
+                                    ui.add_space(4.0);
+                                    if ui.add(pill_btn("Open folder", p.accent)).clicked() {
+                                        open_folder(fpath);
+                                    }
+                                }
+                            }
+                        });
+                    });
+                });
+            });
+        });
+}
+
 // ─── Queue widgets ────────────────────────────────────────────────────────────
 fn queue_item_row(
     ui: &mut egui::Ui,
@@ -3039,91 +3885,6 @@ fn queue_item_row(
                 }
             });
         });
-}
-
-fn scan_peer_row(
-    ui: &mut egui::Ui,
-    p: &Pal,
-    peer: &Peer,
-    selected: bool,
-    is_recent: bool,
-) -> egui::Response {
-    let fill = if selected {
-        tint(p.accent, 22)
-    } else {
-        p.surface
-    };
-    let stroke = if selected {
-        Stroke::new(1.5, p.accent)
-    } else {
-        Stroke::new(1.0, p.border)
-    };
-    let (rect, resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 62.0), Sense::click());
-    let bg = if resp.hovered() {
-        tint(p.accent, 14)
-    } else {
-        fill
-    };
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(10),
-        bg,
-        stroke,
-        egui::StrokeKind::Outside,
-    );
-
-    let av = egui::pos2(rect.left() + 30.0, rect.center().y);
-    let av_col = if is_recent { p.accent } else { p.accent2 };
-    ui.painter().circle_filled(av, 20.0, tint(av_col, 35));
-    ui.painter().text(
-        av,
-        egui::Align2::CENTER_CENTER,
-        &peer
-            .name
-            .chars()
-            .next()
-            .unwrap_or('?')
-            .to_uppercase()
-            .to_string(),
-        egui::FontId::proportional(17.0),
-        av_col,
-    );
-
-    ui.painter().text(
-        egui::pos2(rect.left() + 60.0, rect.center().y - 9.0),
-        egui::Align2::LEFT_CENTER,
-        &peer.name,
-        egui::FontId::proportional(13.5),
-        p.text,
-    );
-    ui.painter().text(
-        egui::pos2(rect.left() + 60.0, rect.center().y + 9.0),
-        egui::Align2::LEFT_CENTER,
-        peer.addr.to_string(),
-        egui::FontId::proportional(11.0),
-        p.text_dim,
-    );
-
-    if selected {
-        ui.painter().text(
-            egui::pos2(rect.right() - 16.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            icons::ICON_CHECK,
-            egui::FontId::proportional(16.0),
-            p.success,
-        );
-    } else if is_recent {
-        ui.painter().text(
-            egui::pos2(rect.right() - 16.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            icons::ICON_SCHEDULE,
-            egui::FontId::proportional(14.0),
-            p.text_faint,
-        );
-    }
-
-    resp
 }
 
 fn drop_zone(ui: &mut egui::Ui, p: &Pal, hovering: bool) {
@@ -3251,6 +4012,7 @@ fn card<R>(ui: &mut egui::Ui, p: &Pal, f: impl FnOnce(&mut egui::Ui) -> R) {
             f(ui);
         });
 }
+
 fn icon_badge(ui: &mut egui::Ui, icon: &str, color: Color32) {
     let (r, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
     ui.painter()
@@ -3263,11 +4025,13 @@ fn icon_badge(ui: &mut egui::Ui, icon: &str, color: Color32) {
         color,
     );
 }
+
 fn pill_btn(text: &str, accent: Color32) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_string()).size(12.0).color(accent))
         .fill(tint(accent, 28))
         .corner_radius(20.0)
 }
+
 fn big_btn(text: &str, accent: Color32) -> egui::Button<'static> {
     egui::Button::new(
         RichText::new(text.to_string())
@@ -3305,6 +4069,7 @@ fn check_item(ui: &mut egui::Ui, p: &Pal, done: bool, label: &str) {
         );
     });
 }
+
 fn radar_graphic(ui: &mut egui::Ui, p: &Pal, pulse: f32, animated: bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(72.0), Sense::hover());
     let c = rect.center();

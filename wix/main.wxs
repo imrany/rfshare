@@ -3,13 +3,13 @@
 
   <Package
         Name="rfshare"
-        Version="0.7.0"
+        Version="0.8.0"
         Manufacturer="Imrany"
         Language="1033"
         UpgradeCode="B1A2C3D4-E5F6-7890-ABCD-EF1234567890"
     >
 
-    <SummaryInformation Description="Fast, encrypted LAN file transfers" />
+    <SummaryInformation Description="Fast, encrypted file transfers" />
 
     <MajorUpgrade
             DowngradeErrorMessage="A newer version of rfshare is already installed."
