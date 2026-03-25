@@ -48,6 +48,9 @@ fn save_prefs(
     peer_name: &str,
     peer_addr: &str,
     sync_map: &std::collections::HashMap<String, PathBuf>,
+    save_dir: Option<&PathBuf>,
+    notify_on_receive: bool,
+    auto_open_folder: bool,
 ) {
     let Some(path) = prefs_path() else { return };
     if let Some(parent) = path.parent() {
@@ -61,6 +64,11 @@ fn save_prefs(
         let safe = device_addr.replace('.', "_").replace(':', "_");
         out.push_str(&format!("sync_device_{}={}\n", safe, folder.display()));
     }
+    if let Some(ref d) = save_dir {
+        out.push_str(&format!("save_dir={}\n", d.display()));
+    }
+    out.push_str(&format!("notify_on_receive={}\n", notify_on_receive as u8));
+    out.push_str(&format!("auto_open_folder={}\n", auto_open_folder as u8));
     let _ = fs::write(&path, out);
 }
 
@@ -70,6 +78,9 @@ struct SavedPrefs {
     peer_addr: String,
     // one sync folder per device: key = peer_addr string
     sync_map: std::collections::HashMap<String, PathBuf>,
+    save_dir: Option<PathBuf>,
+    notify_on_receive: bool,
+    auto_open_folder: bool,
 }
 
 fn load_prefs() -> SavedPrefs {
@@ -97,8 +108,62 @@ fn load_prefs() -> SavedPrefs {
                 prefs.sync_map.insert(addr, PathBuf::from(folder));
             }
         }
+        if let Some(v) = line.strip_prefix("save_dir=") {
+            prefs.save_dir = Some(PathBuf::from(v));
+        }
+        if let Some(v) = line.strip_prefix("notify_on_receive=") {
+            prefs.notify_on_receive = v == "1";
+        }
+        if let Some(v) = line.strip_prefix("auto_open_folder=") {
+            prefs.auto_open_folder = v == "1";
+        }
     }
     prefs
+}
+
+fn toggle_switch(ui: &mut egui::Ui, p: &Pal, on: bool) -> egui::Response {
+    let desired = Vec2::new(36.0, 20.0);
+    let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
+
+    let track_col = if on { p.accent } else { tint(p.text_faint, 80) };
+    let knob_x = if on { rect.right() - 10.0 } else { rect.left() + 10.0 };
+
+    ui.painter().rect_filled(rect, CornerRadius::same(10), track_col);
+    ui.painter().circle_filled(
+        egui::pos2(knob_x, rect.center().y),
+        8.0,
+        Color32::WHITE,
+    );
+    resp
+}
+
+fn fetch_latest_version() -> Option<String> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream = std::net::TcpStream::connect(("github.com", 80)).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+    write!(stream,
+        "GET /imrany/rfshare/releases/latest HTTP/1.1\r\nHost: github.com\r\nUser-Agent: rfshare\r\nConnection: close\r\n\r\n"
+    ).ok()?;
+    for line in BufReader::new(stream).lines().take(20).flatten() {
+        if line.to_ascii_lowercase().starts_with("location:") {
+            if let Some(tag) = line.rsplit('/').next() {
+                if tag.trim().starts_with('v') {
+                    return Some(tag.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_newer(latest: &str, current: &str) -> bool {
+    fn parse(v: &str) -> Option<(u32,u32,u32)> {
+        let v = v.trim_start_matches('v');
+        let mut p = v.splitn(3,'.');
+        Some((p.next()?.parse().ok()?, p.next()?.parse().ok()?,
+              p.next()?.split('-').next()?.parse().ok()?))
+    }
+    matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
 }
 
 // ─── License ─────────────────────────────────────────────────────────────────
@@ -445,6 +510,7 @@ enum SettingsTab {
     Device,
     License,
     About,
+    Preferences,
 }
 
 #[derive(Clone, Debug)]
@@ -458,8 +524,13 @@ struct ReceivedFile {
 
 #[derive(Default)]
 struct RecvState {
-    files: Vec<ReceivedFile>,
-    error: Option<String>,
+    files:             Vec<ReceivedFile>,
+    error:             Option<String>,
+    recv_bytes:        u64,
+    recv_files:        u32,
+    notify_on_receive: bool,
+    auto_open_folder:  bool,
+    save_dir:          Option<PathBuf>,
 }
 
 // ─── App ─────────────────────────────────────────────────────────────────────
@@ -469,7 +540,6 @@ pub struct App {
     scan_state: ScanState,
     selected: Option<usize>,
 
-    // <<< NEW: saved peer info for auto-reconnect
     saved_peer_name: String,
     saved_peer_addr: String,
 
@@ -484,9 +554,7 @@ pub struct App {
     sync_rx: Option<std::sync::mpsc::Receiver<SyncMsg>>,
     sync_active: bool,
     sync_log: Vec<String>,
-    // One sync folder per device (key = peer addr string)
     sync_map: std::collections::HashMap<String, PathBuf>,
-    // Scan tab search filter
     scan_filter: String,
 
     license: License,
@@ -501,20 +569,42 @@ pub struct App {
     show_upgrade: bool,
     version: String,
 
-    // Cached at startup — hostname() spawns a process each frame → CMD flashes on Windows
     this_hostname: String,
     this_ip: String,
+
+    // ── User preferences ──────────────────────────────────────────────────
+    save_dir: PathBuf,          // where received files are saved (default: ~/Downloads)
+    notify_on_receive: bool,    // desktop notification on file received
+    auto_open_folder: bool,     // open folder after receiving
+
+    // ── Session metrics ───────────────────────────────────────────────────
+    session_sent_bytes: u64,
+    session_recv_bytes: u64,
+    session_sent_files: u32,
+    session_recv_files: u32,
+
+    // ── Update checker ────────────────────────────────────────────────────
+    update_available: Option<String>,
+    update_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
 }
 
 impl Default for App {
     fn default() -> Self {
-        let recv_state = Arc::new(Mutex::new(RecvState::default()));
-        let save_dir = dirs::download_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")));
-        let rs = Arc::clone(&recv_state);
-        thread::spawn(move || receive_server(rs, save_dir));
-        let license = License::load();
         let prefs = load_prefs();
+        let recv_state = Arc::new(Mutex::new(RecvState::default()));
+        let save_dir = prefs.save_dir.clone().unwrap_or_else(|| {
+            dirs::download_dir()
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+        });
+        let rs = Arc::clone(&recv_state);
+        let sd = save_dir.clone();
+        thread::spawn(move || receive_server(rs, sd));
+        if let Ok(mut rs) = recv_state.lock() {
+            rs.notify_on_receive = prefs.notify_on_receive;
+            rs.auto_open_folder  = prefs.auto_open_folder;
+            rs.save_dir          = prefs.save_dir.clone();
+        }
+        let license = License::load();
         Self {
             peers: Vec::new(),
             scan_rx: None,
@@ -541,10 +631,22 @@ impl Default for App {
             dark_mode: true,
             scan_pulse: 0.0,
             show_upgrade: false,
-            license,
             version: env!("CARGO_PKG_VERSION").to_string(),
             this_hostname: hostname(),
             this_ip: local_ip(),
+            save_dir: prefs.save_dir.clone().unwrap_or_else(|| {
+                dirs::download_dir()
+                    .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+            }),
+            notify_on_receive: prefs.notify_on_receive,
+            auto_open_folder: prefs.auto_open_folder,
+            session_sent_bytes: 0,
+            session_recv_bytes: 0,
+            session_sent_files: 0,
+            session_recv_files: 0,
+            update_available: None,
+            update_rx: None,
+            license,
         }
     }
 }
@@ -561,7 +663,6 @@ impl App {
         self.license.is_pro()
     }
 
-    // <<< NEW: after a scan completes, try to match the saved peer
     fn _try_auto_select(&mut self) {
         if self.selected.is_some() || self.saved_peer_addr.is_empty() {
             return;
@@ -578,13 +679,12 @@ impl App {
         self.selected.and_then(|i| self.peers.get(i))
     }
 
-    // <<< NEW: save prefs whenever selection or sync folders change
     fn persist_prefs(&self) {
-        let (name, addr) = self
-            .selected_peer()
+        let (name, addr) = self.selected_peer()
             .map(|p| (p.name.as_str(), p.addr.to_string()))
             .unwrap_or((&self.saved_peer_name, self.saved_peer_addr.clone()));
-        save_prefs(name, &addr, &self.sync_map);
+        save_prefs(name, &addr, &self.sync_map,
+            Some(&self.save_dir), self.notify_on_receive, self.auto_open_folder);
     }
 
     fn start_scan(&mut self) {
@@ -715,7 +815,6 @@ impl App {
         });
     }
 
-    // <<< NEW: persistent sync watcher — runs in a loop polling every SYNC_POLL_MS
     fn start_sync_watcher(&mut self) {
         if !self.is_pro() {
             self.show_upgrade = true;
@@ -734,7 +833,6 @@ impl App {
         self.sync_rx = Some(rx);
 
         thread::spawn(move || {
-            // Per-job state: key = absolute path, value = mtime secs at last successful send
             let mut job_mtimes: Vec<std::collections::HashMap<String, u64>> = jobs
                 .iter()
                 .map(|_| std::collections::HashMap::new())
@@ -754,7 +852,6 @@ impl App {
 
                         let key = path.to_string_lossy().to_string();
 
-                        // Get the file's current mtime
                         let current_mtime = fs::metadata(&path)
                             .and_then(|m| m.modified())
                             .map(|t| {
@@ -764,12 +861,10 @@ impl App {
                             })
                             .unwrap_or(0);
 
-                        // Skip if we already sent this exact version (same mtime)
                         if let Some(&last_sent_mtime) = job_mtimes[job_idx].get(&key) {
                             if last_sent_mtime >= current_mtime {
                                 continue;
                             }
-                            // File was modified since last send — fall through to re-send
                         }
 
                         let name = path
@@ -792,7 +887,6 @@ impl App {
                                 });
                             }
                             Ok(SyncResult::Skipped) => {
-                                // Receiver already has this version — record mtime so we don't retry
                                 job_mtimes[job_idx].insert(key, current_mtime);
                                 let _ = tx2.send(SyncMsg::FileSkipped { name: nm });
                             }
@@ -807,14 +901,12 @@ impl App {
         });
     }
 
-    // <<< NEW: rebuild sync jobs from persisted folders + current peer selection
     fn rebuild_sync_jobs(&mut self) {
         let Some(peer) = self.selected_peer().cloned() else {
             self.sync_jobs.clear();
             return;
         };
         let addr_key = peer.addr.to_string();
-        // Single folder per device
         if let Some(folder) = self.sync_map.get(&addr_key).cloned() {
             if folder.exists() {
                 self.sync_jobs = vec![SyncJob {
@@ -840,8 +932,6 @@ impl App {
             return;
         };
         let addr_key = peer.addr.to_string();
-        // One folder per device — replace any existing selection
-        // Stop watcher first if running so it uses the new folder
         if self.sync_active {
             self.sync_rx = None;
             self.sync_active = false;
@@ -877,11 +967,9 @@ impl App {
         if let Some(rx) = &self.scan_rx {
             if let Ok(peers) = rx.try_recv() {
                 self.scan_rx = None;
-                // Collect all local IPs to handle multi-interface machines
                 let local_ips: std::collections::HashSet<String> = {
                     let mut ips = std::collections::HashSet::new();
                     ips.insert(self.this_ip.clone());
-                    // Also filter by hostname match as a fallback
                     ips
                 };
                 self.peers = peers
@@ -891,17 +979,14 @@ impl App {
                     })
                     .collect();
                 self.scan_state = ScanState::Done;
-                // Rebuild sync jobs with newly found peer
                 if self.selected.is_some() {
                     self.rebuild_sync_jobs();
-                    // Auto-start sync watcher if the reconnected peer has saved folders
-                    // and the watcher isn't already running
                     if !self.sync_active && self.is_pro() {
                         if let Some(peer) = self.selected_peer() {
                             let has_folders = self
                                 .sync_map
                                 .get(&peer.addr.to_string())
-                                .map(|_| true) // PathBuf = folder is set
+                                .map(|_| true)
                                 .unwrap_or(false);
                             if has_folders {
                                 self.start_sync_watcher();
@@ -924,6 +1009,8 @@ impl App {
                     Ok(QueueMsg::Done { index }) => {
                         if let Some(item) = self.queue.get_mut(index) {
                             item.progress = Some(1.0);
+                            self.session_sent_bytes += item.size;
+                            self.session_sent_files += 1;
                         }
                     }
                     Ok(QueueMsg::Failed { index, error }) => {
@@ -953,13 +1040,11 @@ impl App {
                         self.sync_log.push(format!("... sending {}", name));
                     }
                     Ok(SyncMsg::FileSent { name, .. }) => {
-                        // Remove the "sending" placeholder and add success
                         let placeholder = format!("... sending {}", name);
                         self.sync_log.retain(|l| l != &placeholder);
                         self.sync_log.push(format!("OK {}", name));
                     }
                     Ok(SyncMsg::FileSkipped { name }) => {
-                        // Remove sending placeholder silently — file was already up to date
                         let placeholder = format!("... sending {}", name);
                         self.sync_log.retain(|l| l != &placeholder);
                     }
@@ -975,10 +1060,16 @@ impl App {
                     }
                 }
             }
-            // Watcher loop runs forever; disconnected only if thread panicked
             if disconnected {
                 self.sync_rx = None;
                 self.sync_active = false;
+            }
+        }
+
+        if let Some(rx) = &self.update_rx {
+            if let Ok(v) = rx.try_recv() {
+                self.update_available = v;
+                self.update_rx = None;
             }
         }
     }
@@ -986,6 +1077,7 @@ impl App {
     fn any_active(&self) -> bool {
         self.queue.iter().any(|q| q.is_active())
     }
+
     fn unread_count(&self) -> usize {
         self.recv_state
             .lock()
@@ -994,6 +1086,137 @@ impl App {
             .iter()
             .filter(|f| !f.seen)
             .count()
+    }
+
+    fn show_preferences_panel(&mut self, ui: &mut egui::Ui) {
+        let p = self.p();
+
+        // ── Save location ─────────────────────────────────────────────────
+        ui.label(RichText::new("Save Location").strong().size(13.0).color(p.text_dim));
+        ui.add_space(8.0);
+        egui::Frame::new()
+            .fill(p.surface2).stroke(Stroke::new(1.0, p.border))
+            .corner_radius(10.0).inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::hover());
+                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
+                        icons::ICON_FOLDER, egui::FontId::proportional(14.0), p.accent);
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Received files folder")
+                            .size(12.0).color(p.text));
+                        let path_str = self.save_dir.to_string_lossy();
+                        let display = if path_str.len() > 48 {
+                            format!("…{}", &path_str[path_str.len().saturating_sub(46)..])
+                        } else { path_str.to_string() };
+                        ui.label(RichText::new(display).size(10.5).color(p.text_faint));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(pill_btn("Browse…", p.accent)).clicked() {
+                            if let Some(folder) = rfd::FileDialog::new()
+                                .set_directory(&self.save_dir)
+                                .pick_folder()
+                            {
+                                self.save_dir = folder;
+                                self.persist_prefs();
+                            }
+                        }
+                        if self.save_dir != dirs::download_dir()
+                            .unwrap_or_else(|| PathBuf::from("."))
+                        {
+                            ui.add_space(6.0);
+                            if ui.add(pill_btn("Reset", p.text_dim)).clicked() {
+                                self.save_dir = dirs::download_dir()
+                                    .unwrap_or_else(|| PathBuf::from("."));
+                                self.persist_prefs();
+                            }
+                        }
+                    });
+                });
+            });
+
+        ui.add_space(20.0);
+
+        // ── Notifications ─────────────────────────────────────────────────
+        ui.label(RichText::new("Notifications").strong().size(13.0).color(p.text_dim));
+        ui.add_space(8.0);
+        egui::Frame::new()
+            .fill(p.surface2).stroke(Stroke::new(1.0, p.border))
+            .corner_radius(10.0).inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Desktop notification on receive")
+                            .size(12.0).color(p.text));
+                        ui.label(RichText::new("Show a system notification when a file arrives")
+                            .size(10.5).color(p.text_faint));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if toggle_switch(ui, &p, self.notify_on_receive).clicked() {
+                            self.notify_on_receive = !self.notify_on_receive;
+                            changed = true;
+                        }
+                    });
+                });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Open folder after receiving")
+                            .size(12.0).color(p.text));
+                        ui.label(RichText::new("Automatically open the save folder when a transfer completes")
+                            .size(10.5).color(p.text_faint));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if toggle_switch(ui, &p, self.auto_open_folder).clicked() {
+                            self.auto_open_folder = !self.auto_open_folder;
+                            changed = true;
+                        }
+                    });
+                });
+
+                if changed { self.persist_prefs(); }
+            });
+
+        ui.add_space(20.0);
+
+        // ── Appearance ────────────────────────────────────────────────────
+        ui.label(RichText::new("Appearance").strong().size(13.0).color(p.text_dim));
+        ui.add_space(8.0);
+        egui::Frame::new()
+            .fill(p.surface2).stroke(Stroke::new(1.0, p.border))
+            .corner_radius(10.0).inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Theme").size(12.0).color(p.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for (lbl, is_dark) in [("Dark", true), ("Light", false)] {
+                            let active = self.dark_mode == is_dark;
+                            let col = if active { p.accent } else { p.text_dim };
+                            let fill = if active { tint(p.accent, 22) } else { p.surface };
+                            if ui.add(egui::Button::new(
+                                RichText::new(lbl).size(12.0).color(col))
+                                .fill(fill)
+                                .stroke(Stroke::new(1.0, if active { p.accent } else { p.border }))
+                                .corner_radius(6.0)
+                                .min_size(Vec2::new(60.0, 28.0))).clicked()
+                            {
+                                self.dark_mode = is_dark;
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+                });
+            });
     }
 }
 
@@ -1031,6 +1254,7 @@ impl eframe::App for App {
         });
 
         self.poll();
+        self.check_for_update();
         let scanning = self.scan_state == ScanState::Scanning;
         if scanning {
             self.scan_pulse += ctx.input(|i| i.unstable_dt) * 2.5;
@@ -1087,11 +1311,9 @@ impl eframe::App for App {
                         );
                         ui.add_space(16.0);
 
-                        // Feature rows — fixed width so they stay centered as a block
                         let feat_w = 300.0f32;
                         for (icon, feat) in [
                             ("📁", "Folder sync — auto-send new files in a folder"),
-                            // ("📜", "Transfer history — full searchable log"),
                             ("🏢", "Unlimited devices  /  org license"),
                             ("🔐", "End-to-end encrypted transfers"),
                             ("⚡", "Priority support"),
@@ -1190,34 +1412,8 @@ impl eframe::App for App {
                     );
                     ui.add_space(6.0);
                     ui.label(RichText::new("rfshare").size(15.0).strong().color(p.text));
-                    if self.is_pro() {
-                        ui.add_space(4.0);
-                        let (r, _) = ui.allocate_exact_size(Vec2::new(30.0, 16.0), Sense::hover());
-                        ui.painter().rect_filled(r, 3.0, tint(p.pro, 25));
-                        ui.painter().text(
-                            r.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "PRO",
-                            egui::FontId::proportional(8.5),
-                            p.pro,
-                        );
-                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(if self.dark_mode { "☀" } else { "🌙" })
-                                        .size(14.0)
-                                        .color(p.text_dim),
-                                )
-                                .frame(false)
-                                .min_size(Vec2::splat(36.0)),
-                            )
-                            .clicked()
-                        {
-                            self.dark_mode = !self.dark_mode;
-                        }
-                        ui.add_space(2.0);
                         let tab_defs: &[(&str, Tab, bool)] = &[
                             ("Settings", Tab::Settings, false),
                             ("History", Tab::History, false),
@@ -1226,7 +1422,6 @@ impl eframe::App for App {
                             ("Scan", Tab::Scan, false),
                         ];
 
-                        // Count unseen received files for History badge
                         let history_new = self
                             .recv_state
                             .lock()
@@ -1269,13 +1464,9 @@ impl eframe::App for App {
                                     if self.tab == Tab::History {
                                         self.history = load_history();
                                     }
-                                    // if self.tab == Tab::Scan{
-                                    //     self.start_scan();
-                                    // }
                                 }
                             }
 
-                            // Active underline
                             if active {
                                 let r = resp.rect;
                                 ui.painter().line_segment(
@@ -1287,7 +1478,6 @@ impl eframe::App for App {
                                 );
                             }
 
-                            // History badge: amber dot with count (hidden when Pro-locked)
                             if *lbl == "History" && history_new > 0 {
                                 let dot =
                                     egui::pos2(resp.rect.right() + 4.0, resp.rect.top() + 11.0);
@@ -1311,57 +1501,92 @@ impl eframe::App for App {
                 });
             });
 
-        // ── Footer ─────────────────────────────────────────────────────────
-        egui::TopBottomPanel::bottom("footer")
-            .frame(
-                egui::Frame::new()
-                    .fill(p.surface)
-                    .stroke(Stroke::new(1.0, p.border))
-                    .inner_margin(egui::Margin {
-                        left: 8,
-                        right: 8,
-                        top: 7,
-                        bottom: 7,
-                    }),
-            )
-            .exact_height(36.0)
+        // At the bottom (statusbar)
+        egui::TopBottomPanel::bottom("statusbar")
+            .frame(egui::Frame::new()
+                .fill(p.surface)
+                .stroke(Stroke::new(1.0, p.border))
+                .inner_margin(egui::Margin { left: 12, right: 12, top: 0, bottom: 0 }))
+            .exact_height(28.0)
             .show(ctx, |ui| {
-                ui.with_layout(
-                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                    |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(
+                        RichText::new(format!("rfshare v{}", self.version))
+                            .size(10.5).color(p.text_faint),
+                    );
+
+                    if let Some(ref latest) = self.update_available {
+                        ui.add_space(6.0);
+                        let resp = ui.add(
+                            egui::Button::new(
+                                RichText::new(format!("↑ {} available", latest))
+                                    .size(10.0).color(p.warn).strong()
+                            ).frame(false)
+                        );
+                        if resp.clicked() {
+                            open_url("https://github.com/imrany/rfshare/releases/latest");
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::centered_and_justified(
+                        egui::Direction::LeftToRight), |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("v{}", self.version.clone()))
-                                    .size(11.0)
-                                    .color(p.text_faint),
-                            );
-                            footer_sep(ui, p.text_faint);
-                            if !self.is_pro() {
-                                if footer_link(
-                                    ui,
-                                    &format!("{}  Get Pro", icons::ICON_STAR),
-                                    p.pro,
-                                    p.pro,
-                                )
-                                .clicked()
-                                {
-                                    self.show_upgrade = true;
-                                }
-                                footer_sep(ui, p.text_faint);
-                            }
-                            if footer_link(
-                                ui,
-                                &format!("{}  License", icons::ICON_LICENSE),
-                                p.text_dim,
-                                p.accent,
-                            )
-                            .clicked()
-                            {
-                                open_url("https://github.com/imrany/rfshare/blob/main/LICENSE");
-                            }
+                            let total_sent = self.history.iter()
+                                .filter(|e| e.direction == TransferDir::Sent && e.success)
+                                .count();
+                            let total_recv = self.history.iter()
+                                .filter(|e| e.direction == TransferDir::Received && e.success)
+                                .count();
+                            let bytes_sent: u64 = self.history.iter()
+                                .filter(|e| e.direction == TransferDir::Sent && e.success)
+                                .map(|e| e.file_size).sum();
+                            let bytes_recv: u64 = self.history.iter()
+                                .filter(|e| e.direction == TransferDir::Received && e.success)
+                                .map(|e| e.file_size).sum();
+                            status_metric(ui, &p, icons::ICON_UPLOAD,
+                                &format!("{} · {} file{}",
+                                    format_size(bytes_sent),
+                                    total_sent,
+                                    if total_sent == 1 { "" } else { "s" }));
+                            ui.add_space(16.0);
+                            status_metric(ui, &p, icons::ICON_DOWNLOAD,
+                                &format!("{} · {} file{}",
+                                    format_size(bytes_recv),
+                                    total_recv,
+                                    if total_recv == 1 { "" } else { "s" }));
                         });
-                    },
-                );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.is_pro() {
+                            let (r, _) = ui.allocate_exact_size(
+                                Vec2::new(26.0, 14.0), Sense::hover());
+                            ui.painter().rect_filled(r, 3.0, tint(p.pro, 30));
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
+                                "PRO", egui::FontId::proportional(8.0), p.pro);
+                            ui.add_space(6.0);
+                        }
+                        if let Some(peer) = self.selected_peer() {
+                            ui.painter().circle_filled(
+                                ui.cursor().left_top() + Vec2::new(4.0, 7.0),
+                                4.0, p.success);
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new(&peer.name)
+                                    .size(10.5).color(p.text_dim),
+                            );
+                        } else {
+                            ui.painter().circle_filled(
+                                ui.cursor().left_top() + Vec2::new(4.0, 7.0),
+                                4.0, p.text_faint);
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new("No device connected")
+                                    .size(10.5).color(p.text_faint),
+                            );
+                        }
+                    });
+                });
             });
 
         egui::CentralPanel::default()
@@ -1395,50 +1620,46 @@ impl App {
                 ui.add_space(x_pad);
                 ui.vertical(|ui| {
                     ui.set_width(col_w);
-                    // ── Scan header ───────────────────────────────────────────
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.scan_state != ScanState::Idle && !scanning {
-                                    if ui.add(egui::Button::new(
-                                        RichText::new(format!("  {}  ", "Rescan")).size(13.0).strong().color(Color32::WHITE))
-                                        .fill(p.accent).corner_radius(8.0)
-                                        .min_size(Vec2::new(80.0, 32.0))).clicked()
-                                    {
-                                        self.start_scan();
-                                    }
-                                    ui.add_space(8.0);
-                                    // ── Search field ──────────────────────────────────────────
-                                        egui::Frame::new()
-                                            .fill(p.surface2)
-                                            .stroke(Stroke::new(1.0, if !self.scan_filter.is_empty() { p.accent } else { p.border }))
-                                            .corner_radius(8.0)
-                                            .inner_margin(egui::Margin { left: 10, right: 10, top: 6, bottom: 6 })
-                                            .show(ui, |ui| {
-                                                ui.set_min_width(ui.available_width());
-                                                ui.horizontal(|ui| {
-                                                    ui.label(RichText::new(icons::ICON_SEARCH).size(14.0).color(p.text_dim));
-                                                    ui.add_space(6.0);
-                                                    ui.add(egui::TextEdit::singleline(&mut self.scan_filter)
-                                                        .hint_text("Search by name or IP…")
-                                                        .desired_width(ui.available_width()  - 33.0)
-                                                        .frame(false));
-                                                    if !self.scan_filter.is_empty() {
-                                                        if ui.add(egui::Button::new(
-                                                            RichText::new(icons::ICON_CLOSE).size(12.0).color(p.text_dim))
-                                                            .frame(false)).clicked()
-                                                        {
-                                                            self.scan_filter.clear();
-                                                        }
-                                                    }
-                                                });
-                                            });
-                                };
+                                if ui.add(egui::Button::new(
+                                    RichText::new(format!("  {}  ", "Rescan")).size(13.0).strong().color(Color32::WHITE))
+                                    .fill(p.accent).corner_radius(8.0)
+                                    .min_size(Vec2::new(80.0, 32.0))).clicked()
+                                {
+                                    self.start_scan();
+                                }
+                                ui.add_space(8.0);
+                                egui::Frame::new()
+                                    .fill(p.surface2)
+                                    .stroke(Stroke::new(1.0, if !self.scan_filter.is_empty() { p.accent } else { p.border }))
+                                    .corner_radius(8.0)
+                                    .inner_margin(egui::Margin { left: 10, right: 10, top: 6, bottom: 6 })
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(icons::ICON_SEARCH).size(14.0).color(p.text_dim));
+                                            ui.add_space(6.0);
+                                            ui.add(egui::TextEdit::singleline(&mut self.scan_filter)
+                                                .hint_text("Search by name or IP…")
+                                                .desired_width(ui.available_width() - 33.0)
+                                                .frame(false));
+                                            if !self.scan_filter.is_empty() {
+                                                if ui.add(egui::Button::new(
+                                                    RichText::new(icons::ICON_CLOSE).size(12.0).color(p.text_dim))
+                                                    .frame(false)).clicked()
+                                                {
+                                                    self.scan_filter.clear();
+                                                }
+                                            }
+                                        });
+                                    });
+                            }
                         });
                     });
                     ui.add_space(12.0);
 
-
-                    // ── Scan idle state ───────────────────────────────────────
                     if self.scan_state == ScanState::Idle {
                         ui.vertical_centered(|ui| {
                             ui.add_space(24.0);
@@ -1452,7 +1673,6 @@ impl App {
                             }
                         });
                         ui.add_space(24.0);
-                        // Still show the recent device even in idle state
                     }
 
                     if self.scan_state == ScanState::Scanning {
@@ -1467,16 +1687,13 @@ impl App {
                         ctx.request_repaint_after(std::time::Duration::from_millis(40));
                     }
 
-                    // ── Device list (shown after scan) ────────────────────────
                     if self.scan_state == ScanState::Done {
                         let filter = self.scan_filter.to_lowercase();
 
-                        // Partition: saved/familiar device first, then others
                         let peers = self.peers.clone();
                         let (mut recent, mut others): (Vec<_>, Vec<_>) = peers.iter()
                             .enumerate()
                             .partition(|(_, p)| p.addr.to_string() == self.saved_peer_addr);
-                        // Sort others alphabetically
                         others.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
                         let ordered: Vec<(usize, &Peer)> = recent.drain(..).chain(others.drain(..)).collect();
 
@@ -1502,7 +1719,6 @@ impl App {
                                 ui.add_space(20.0);
                             });
                         } else {
-                            // Section header for recent device if present
                             let first_is_recent = !self.saved_peer_addr.is_empty()
                                 && visible.first().map(|(_, p)| p.addr.to_string() == self.saved_peer_addr)
                                 .unwrap_or(false);
@@ -1533,7 +1749,6 @@ impl App {
                                         self.saved_peer_addr = peer.addr.to_string();
                                         self.rebuild_sync_jobs();
                                         self.persist_prefs();
-                                        // Switch to Send tab so user can queue files
                                         self.tab = Tab::Send;
                                     } else {
                                         self.rebuild_sync_jobs();
@@ -1544,7 +1759,6 @@ impl App {
                         }
                     }
 
-                    // ── Not-found banner for saved device ─────────────────────
                     if self.scan_state == ScanState::Done
                         && !self.saved_peer_name.is_empty()
                         && !self.peers.iter().any(|p| p.addr.to_string() == self.saved_peer_addr)
@@ -1576,6 +1790,59 @@ impl App {
         let avail = ui.available_size();
         let pad = if wide { 28.0f32 } else { 16.0f32 };
         let gap = 16.0f32;
+        if let Some(peer) = self.selected_peer().cloned() {
+            let p2 = self.p();
+            egui::Frame::new()
+                .fill(tint(p2.accent, 15))
+                .stroke(Stroke::new(1.0, tint(p2.accent, 45)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin { left: 12, right: 8, top: 6, bottom: 6 })
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.painter().circle_filled(
+                            ui.cursor().left_top() + Vec2::new(4.0, 8.0),
+                            4.0, p2.success);
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(format!(
+                            "Sending to  {}  ·  {}", peer.name, peer.addr))
+                            .size(12.0).color(p2.accent));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new(
+                                RichText::new("Change").size(11.0).color(p2.text_dim))
+                                .frame(false)).clicked()
+                            {
+                                self.tab = Tab::Scan;
+                            }
+                        });
+                    });
+                });
+            ui.add_space(8.0);
+        } else {
+            let p2 = self.p();
+            egui::Frame::new()
+                .fill(tint(p2.warn, 10))
+                .stroke(Stroke::new(1.0, tint(p2.warn, 40)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin { left: 12, right: 8, top: 6, bottom: 6 })
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("⚠  No device selected")
+                            .size(12.0).color(p2.warn));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new(
+                                RichText::new("Scan now").size(11.0).color(p2.accent))
+                                .frame(false)).clicked()
+                            {
+                                self.tab = Tab::Scan;
+                                self.start_scan();
+                            }
+                        });
+                    });
+                });
+            ui.add_space(8.0);
+        }
         if wide {
             let col = (avail.x - pad * 2.0 - gap) / 2.0;
             ui.add_space(24.0);
@@ -1804,7 +2071,7 @@ impl App {
                     ui.add_space(x_pad);
                     ui.vertical(|ui| {
                         ui.set_width(col_w);
-                        // ── Header row: title + actions ──────────────────────
+
                         ui.horizontal(|ui| {
                             if !self.history.is_empty() {
                                 icon_badge(ui, "📜", p.accent);
@@ -1845,7 +2112,6 @@ impl App {
                         });
                         ui.add_space(10.0);
 
-                        // ── Search bar (always visible, styled as a proper field) ──
                         if !self.history.is_empty() {
                             egui::Frame::new()
                                 .fill(p.surface2)
@@ -1877,7 +2143,6 @@ impl App {
                                         let resp = ui.add(
                                             egui::TextEdit::singleline(&mut self.history_filter)
                                                 .hint_text("Search by filename or device…")
-                                                // .desired_width(f32::INFINITY)
                                                 .desired_width(ui.available_width() - 33.0)
                                                 .frame(false),
                                         );
@@ -1960,7 +2225,6 @@ impl App {
     }
 }
 
-// <<< NEW: fully updated history_row with size, path, open-folder, deleted state
 fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
     let file_exists = entry.file_exists();
     let is_received = entry.direction == TransferDir::Received;
@@ -1986,14 +2250,11 @@ fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
-            // Allocate the right column FIRST so it anchors to the right edge,
-            // then the left content fills whatever remains.
-            let right_w = 88.0f32; // fixed width for timestamp + button
+            let right_w = 88.0f32;
             let total_w = ui.available_width();
             let left_w = (total_w - right_w - 10.0).max(80.0);
 
             ui.horizontal(|ui| {
-                // ── Left: icon + text content ──────────────────────────────
                 let (dir_icon, dir_col) = if entry.direction == TransferDir::Sent {
                     (icons::ICON_UPLOAD, p.accent)
                 } else {
@@ -2012,8 +2273,7 @@ fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
 
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
-                    ui.set_width(left_w - 52.0); // icon(32) + gap(10) + buffer(10)
-                    // Row 1: filename + badges
+                    ui.set_width(left_w - 52.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
                             RichText::new(truncate_filename(&entry.file_name, 32))
@@ -2030,7 +2290,6 @@ fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
                         }
                     });
                     ui.add_space(2.0);
-                    // Row 2: direction · peer · size
                     let dir_word = if entry.direction == TransferDir::Sent {
                         "to"
                     } else {
@@ -2046,7 +2305,6 @@ fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
                         .size(11.0)
                         .color(p.text_dim),
                     );
-                    // Row 3: file path
                     if let Some(ref fpath) = entry.file_path {
                         let path_str = fpath.to_string_lossy();
                         let display = if path_str.len() > 50 {
@@ -2065,7 +2323,6 @@ fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
                     }
                 });
 
-                // ── Right: timestamp + open-folder (pinned to right edge) ──
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.set_width(right_w);
                     ui.vertical(|ui| {
@@ -2111,14 +2368,12 @@ impl App {
                 ui.vertical(|ui| {
                     ui.set_width(col_w);
 
-                    // Header
                     ui.horizontal(|ui| {
                         icon_badge(ui, "📁", p.accent);
                         ui.add_space(8.0);
                         ui.label(RichText::new("Folder Sync").strong().size(15.0).color(p.text));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.sync_active {
-                                // Stop watching button
                                 if ui.add(pill_btn(&format!("{}  Stop watching", icons::ICON_STOP_CIRCLE), p.danger)).clicked() {
                                     self.stop_sync();
                                 }
@@ -2144,7 +2399,6 @@ impl App {
                         .size(12.0).color(p.text_dim));
                     ui.add_space(14.0);
 
-                    // <<< NEW: device availability warning
                     if !peer_available {
                         egui::Frame::new().fill(tint(p.warn,12)).stroke(Stroke::new(1.0,tint(p.warn,50)))
                             .corner_radius(8.0).inner_margin(egui::Margin::same(12))
@@ -2164,7 +2418,6 @@ impl App {
                         ui.add_space(12.0);
                     }
 
-                    // Add folder button
                     ui.add_enabled_ui(peer_available, |ui| {
                         let has_folder = self.selected_peer()
                             .and_then(|p| self.sync_map.get(&p.addr.to_string()))
@@ -2181,15 +2434,13 @@ impl App {
                     });
                     ui.add_space(12.0);
 
-                    // <<< NEW: show persistent sync folders
-                    // ── Single sync folder for this device ───────────────
                     let current_folder: Option<PathBuf> = self.selected_peer()
                         .and_then(|peer| self.sync_map.get(&peer.addr.to_string()))
                         .cloned();
 
                     if let Some(ref folder) = current_folder {
                         let folder_exists = folder.exists();
-                        let sent_count    = self.sync_jobs.first()
+                        let sent_count = self.sync_jobs.first()
                             .map(|j| j.file_mtimes.len()).unwrap_or(0);
                         let border_col = if !folder_exists { tint(p.warn, 55) }
                                          else if self.sync_active { tint(p.success, 55) }
@@ -2204,7 +2455,6 @@ impl App {
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    // Folder icon circle
                                     let (r, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
                                     let ic_col = if !folder_exists { p.warn } else { p.accent };
                                     ui.painter().circle_filled(r.center(), 18.0, tint(ic_col, 20));
@@ -2213,7 +2463,6 @@ impl App {
                                     ui.add_space(12.0);
 
                                     ui.vertical(|ui| {
-                                        // Folder name + badges
                                         ui.horizontal(|ui| {
                                             ui.label(RichText::new(
                                                 folder.file_name().unwrap_or_default().to_string_lossy())
@@ -2226,7 +2475,6 @@ impl App {
                                                 status_badge(ui, "MISSING", p.warn);
                                             }
                                         });
-                                        // Full path, truncated
                                         let full = folder.to_string_lossy();
                                         let display = if full.len() > 50 {
                                             format!("…{}", &full[full.len().saturating_sub(48)..])
@@ -2236,7 +2484,6 @@ impl App {
                                             .size(11.0).color(p.text_dim));
                                     });
 
-                                    // Actions: remove button on the right
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if ui.add(egui::Button::new(
                                             RichText::new(icons::ICON_CLOSE).size(13.0).color(p.text_dim))
@@ -2248,7 +2495,6 @@ impl App {
                                 });
                             });
                     } else {
-                        // No folder selected yet
                         ui.vertical_centered(|ui| {
                             ui.add_space(30.0);
                             ui.label(RichText::new("📁").size(44.0));
@@ -2263,57 +2509,54 @@ impl App {
                         });
                     }
 
-                    // Sync log — expands to fill all remaining vertical space
                     if !self.sync_log.is_empty() && peer_available {
-                                            ui.add_space(16.0);
-                                            ui.separator();
-                                            ui.add_space(8.0);
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new("Activity log")
-                                                        .size(12.0).strong().color(p.text_dim),
-                                                );
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        if ui.add(pill_btn("Clear", p.text_faint)).clicked() {
-                                                            self.sync_log.clear();
-                                                        }
-                                                    },
-                                                );
-                                            });
-                                            ui.add_space(6.0);
+                        ui.add_space(16.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Activity log")
+                                    .size(12.0).strong().color(p.text_dim),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.add(pill_btn("Clear", p.text_faint)).clicked() {
+                                        self.sync_log.clear();
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(6.0);
 
-                                            // Stretch the frame to consume all remaining height in the panel
-                                            let remaining = ui.available_height().max(180.0);
-                                            egui::Frame::new()
-                                                .fill(p.surface2)
-                                                .corner_radius(8.0)
-                                                .inner_margin(egui::Margin::same(10))
-                                                .show(ui, |ui| {
-                                                    ui.set_min_size(Vec2::new(ui.available_width(), remaining - 20.0));
-                                                    egui::ScrollArea::vertical()
-                                                        .max_height(f32::INFINITY)
-                                                        .auto_shrink([false, false])
-                                                        .stick_to_bottom(true)
-                                                        .show(ui, |ui| {
-                                                            ui.set_min_width(ui.available_width());
-                                                            for line in self.sync_log.iter().rev() {
-                                                                let col = if line.starts_with("OK") { p.success }
-                                                                          else if line.starts_with("...") { p.text_dim }
-                                                                          else { p.danger };
-                                                                ui.label(
-                                                                    RichText::new(line).size(11.0).color(col),
-                                                                );
-                                                            }
-                                                        });
-                                                });
+                        let remaining = ui.available_height().max(180.0);
+                        egui::Frame::new()
+                            .fill(p.surface2)
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_min_size(Vec2::new(ui.available_width(), remaining - 20.0));
+                                egui::ScrollArea::vertical()
+                                    .max_height(f32::INFINITY)
+                                    .auto_shrink([false, false])
+                                    .stick_to_bottom(true)
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        for line in self.sync_log.iter().rev() {
+                                            let col = if line.starts_with("OK") { p.success }
+                                                      else if line.starts_with("...") { p.text_dim }
+                                                      else { p.danger };
+                                            ui.label(
+                                                RichText::new(line).size(11.0).color(col),
+                                            );
+                                        }
+                                    });
+                            });
                     }
                 });
             });
             ui.add_space(24.0);
         });
 
-        // Keep requesting repaint while sync is active so the log stays live
         if self.sync_active {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
@@ -2342,6 +2585,7 @@ impl App {
                         ui.horizontal(|ui| {
                             for (lbl, st) in [
                                 ("Device", SettingsTab::Device),
+                                ("Preferences", SettingsTab::Preferences),
                                 ("License", SettingsTab::License),
                                 ("About", SettingsTab::About),
                             ] {
@@ -2373,6 +2617,7 @@ impl App {
                             SettingsTab::Device => self.show_device_panel(ui),
                             SettingsTab::License => self.show_license_panel(ui),
                             SettingsTab::About => self.show_about_panel(ui),
+                            SettingsTab::Preferences => self.show_preferences_panel(ui),
                         }
                     });
                 });
@@ -2383,7 +2628,6 @@ impl App {
     fn show_device_panel(&self, ui: &mut egui::Ui) {
         let p = self.p();
 
-        // ── This device ──────────────────────────────────────────────────────
         ui.label(
             RichText::new("This Device")
                 .strong()
@@ -2426,7 +2670,6 @@ impl App {
 
         ui.add_space(20.0);
 
-        // ── Connected device (last used) ──────────────────────────────────────
         ui.label(
             RichText::new("Connected Device")
                 .strong()
@@ -2464,7 +2707,6 @@ impl App {
                     ui.add_space(8.0);
                     info_row(ui, &p, icons::ICON_WIFI, "Address", &peer.addr.to_string());
                     ui.add_space(8.0);
-                    // Sync folders for this device
                     let sync_folder = self
                         .sync_map
                         .get(&peer.addr.to_string())
@@ -2693,6 +2935,17 @@ impl App {
             }
         });
     }
+
+    fn check_for_update(&mut self) {
+        if self.update_rx.is_some() || self.update_available.is_some() { return; }
+        let current = self.version.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+        self.update_rx = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(fetch_latest_version()
+                .filter(|v| is_newer(v, &current)));
+        });
+    }
 }
 
 // ─── Queue widgets ────────────────────────────────────────────────────────────
@@ -2820,7 +3073,6 @@ fn scan_peer_row(
         egui::StrokeKind::Outside,
     );
 
-    // Avatar circle
     let av = egui::pos2(rect.left() + 30.0, rect.center().y);
     let av_col = if is_recent { p.accent } else { p.accent2 };
     ui.painter().circle_filled(av, 20.0, tint(av_col, 35));
@@ -2838,7 +3090,6 @@ fn scan_peer_row(
         av_col,
     );
 
-    // Name + address
     ui.painter().text(
         egui::pos2(rect.left() + 60.0, rect.center().y - 9.0),
         egui::Align2::LEFT_CENTER,
@@ -2854,7 +3105,6 @@ fn scan_peer_row(
         p.text_dim,
     );
 
-    // Right side: selected checkmark or recent star
     if selected {
         ui.painter().text(
             egui::pos2(rect.right() - 16.0, rect.center().y),
@@ -3081,24 +3331,13 @@ fn radar_graphic(ui: &mut egui::Ui, p: &Pal, pulse: f32, animated: bool) {
         Color32::WHITE,
     );
 }
-fn footer_sep(ui: &mut egui::Ui, color: Color32) {
-    ui.add_space(4.0);
-    ui.label(RichText::new("·").size(11.0).color(color));
-    ui.add_space(4.0);
-}
-fn footer_link(ui: &mut egui::Ui, label: &str, normal: Color32, hover: Color32) -> egui::Response {
-    let resp =
-        ui.add(egui::Button::new(RichText::new(label).size(11.0).color(normal)).frame(false));
-    if resp.hovered() {
-        ui.painter().text(
-            resp.rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(11.0),
-            hover,
-        );
-    }
-    resp
+
+fn status_metric(ui: &mut egui::Ui, p: &Pal, icon: &str, text: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(icon).size(11.0).color(p.text_faint));
+        ui.add_space(3.0);
+        ui.label(RichText::new(text).size(10.5).color(p.text_dim));
+    });
 }
 
 // ─── Networking ───────────────────────────────────────────────────────────────
@@ -3134,6 +3373,10 @@ fn receive_server(state: Arc<Mutex<RecvState>>, save_dir: PathBuf) {
                     file_path: Some(f.path.clone()),
                 });
                 if let Ok(mut s) = s2.lock() {
+                    s.recv_bytes += f.size;
+                    s.recv_files += 1;
+                    let auto_open = s.auto_open_folder;
+                    if auto_open { open_folder(&f.path); }
                     s.files.push(f);
                 }
             }
@@ -3212,9 +3455,7 @@ fn read_encrypted(stream: &mut TcpStream, cipher: &Aes256Gcm) -> Result<Vec<u8>,
     stream.read_exact(&mut enc).map_err(|e| e.to_string())?;
     decrypt_chunk(cipher, &enc)
 }
-/// Sync-aware send: includes mtime in the offer so the receiver can decide
-/// whether it already has the current version.  Returns SyncResult::Skipped if
-/// the receiver replied MAGIC_SKIP, SyncResult::Sent on success.
+
 fn send_file_sync(
     path: &std::path::Path,
     name: &str,
@@ -3225,7 +3466,6 @@ fn send_file_sync(
     let mut stream =
         TcpStream::connect((addr, TRANSFER_PORT)).map_err(|e| format!("Cannot connect: {}", e))?;
 
-    // ECDH handshake
     let sender_secret = EphemeralSecret::random_from_rng(AeadOsRng);
     let sender_pub = PublicKey::from(&sender_secret);
     stream
@@ -3241,11 +3481,9 @@ fn send_file_sync(
     let aes_key = derive_key(shared.as_bytes());
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
 
-    // Build sync offer: MAGIC_OFFER | name_len u32 | name | file_size u64 | mtime u64
     let nb = name.as_bytes();
     let hn = hostname();
     let hb = hn.as_bytes();
-    // Offer: MAGIC_OFFER | name_len | name | file_size | hostname_len | hostname | mtime
     let mut offer = Vec::with_capacity(1 + 4 + nb.len() + 8 + 4 + hb.len() + 8);
     offer.push(MAGIC_OFFER);
     offer.extend_from_slice(&(nb.len() as u32).to_le_bytes());
@@ -3257,7 +3495,6 @@ fn send_file_sync(
     write_encrypted(&mut stream, &cipher, &offer)?;
     stream.flush().map_err(|e| e.to_string())?;
 
-    // Receiver replies MAGIC_SKIP or MAGIC_RESUME
     let mut resp_buf = [0u8; 1];
     stream
         .read_exact(&mut resp_buf)
@@ -3276,7 +3513,6 @@ fn send_file_sync(
     }
     let resume_offset = u64::from_le_bytes(resume_payload[..8].try_into().unwrap());
 
-    // Stream chunks (same as resumable protocol)
     let mut file = fs::File::open(path).map_err(|e| format!("Cannot open file: {}", e))?;
     if resume_offset > 0 {
         file.seek(SeekFrom::Start(resume_offset))
@@ -3322,7 +3558,6 @@ fn send_file_resumable(
     let nb = name.as_bytes();
     let hn = hostname();
     let hb = hn.as_bytes();
-    // Offer: MAGIC_OFFER | name_len u32 | name | file_size u64 | hostname_len u32 | hostname
     let mut offer = Vec::with_capacity(1 + 4 + nb.len() + 8 + 4 + hb.len());
     offer.push(MAGIC_OFFER);
     offer.extend_from_slice(&(nb.len() as u32).to_le_bytes());
@@ -3372,7 +3607,6 @@ fn receive_file_resumable(
     mut stream: TcpStream,
     save_dir: &std::path::Path,
 ) -> Result<ReceivedFile, String> {
-    // Capture sender IP at the start before consuming the stream
     let sender_ip = stream
         .peer_addr()
         .map(|a| a.ip().to_string())
@@ -3411,9 +3645,7 @@ fn receive_file_resumable(
         return Err("File too large (>8 GB)".into());
     }
 
-    // Optional sender hostname — appended after file_size as: hn_len u32 | hostname bytes
-    // Falls back to IP if not present (older sender versions)
-    let base = 5 + name_len + 8; // byte offset right after file_size
+    let base = 5 + name_len + 8;
     let sender_hostname: String = if offer.len() >= base + 4 {
         let hn_len = u32::from_le_bytes(offer[base..base + 4].try_into().unwrap()) as usize;
         if hn_len > 0 && hn_len <= 256 && offer.len() >= base + 4 + hn_len {
@@ -3425,7 +3657,6 @@ fn receive_file_resumable(
         sender_ip.clone()
     };
 
-    // Optional mtime field — sync offers append after the hostname block
     let mtime_base = if offer.len() >= base + 4 {
         let hn_len = u32::from_le_bytes(offer[base..base + 4].try_into().unwrap()) as usize;
         base + 4 + hn_len.min(256)
@@ -3443,7 +3674,6 @@ fn receive_file_resumable(
     let _ = fs::create_dir_all(save_dir);
     let dest = save_dir.join(&name);
 
-    // ── Mtime dedup: if receiver already has same/newer version, send MAGIC_SKIP ──
     if let Some(incoming_mtime) = sender_mtime {
         if dest.exists() {
             let existing_mtime = fs::metadata(&dest)
@@ -3455,17 +3685,14 @@ fn receive_file_resumable(
                 })
                 .unwrap_or(0);
             if existing_mtime >= incoming_mtime {
-                // Already up to date — tell sender to skip
                 stream.write_all(&[MAGIC_SKIP]).map_err(|e| e.to_string())?;
                 stream.flush().map_err(|e| e.to_string())?;
                 return Err(format!("__skip__{}", name));
             }
-            // Incoming is newer — remove old file so it gets replaced cleanly
             let _ = fs::remove_file(&dest);
         }
     }
 
-    // For sync updates, always start fresh (no partial resume of a replaced file)
     let is_sync = sender_mtime.is_some();
     let resume_offset: u64 = if !is_sync && dest.exists() {
         fs::metadata(&dest).map(|m| m.len()).unwrap_or(0)
@@ -3521,7 +3748,7 @@ fn receive_file_resumable(
         size: file_size,
         path: dest,
         seen: false,
-        peer_name: sender_hostname, // hostname, falls back to IP for old senders
+        peer_name: sender_hostname,
     })
 }
 
@@ -3557,7 +3784,6 @@ fn truncate_filename(name: &str, max_len: usize) -> String {
     format!("{}…{}", t, &name[name.len().saturating_sub(4)..])
 }
 fn local_ip() -> String {
-    // Connect a UDP socket (no data sent) to discover which local IP the OS would use
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| {
             s.connect("8.8.8.8:80")?;
@@ -3699,6 +3925,7 @@ fn main() -> eframe::Result<()> {
             ),
         ..Default::default()
     };
+
     eframe::run_native(
         "rfshare",
         options,
