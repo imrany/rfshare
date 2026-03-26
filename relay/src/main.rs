@@ -45,7 +45,7 @@ fn now_str() -> String {
 
 macro_rules! log {
     ($lvl:expr, $($arg:tt)*) => {
-        println!("[{}] [{}] {}", now_str(), $lvl, format!($($arg)*));
+        println!("[{}] [{}] {}", now_str(), $lvl, format!($($arg)*))
     };
 }
 macro_rules! info  { ($($a:tt)*) => { log!("INFO ", $($a)*) } }
@@ -208,6 +208,7 @@ fn handle(mut stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
 fn main() {
     let addr     = std::env::args().nth(1).unwrap_or_else(|| "0.0.0.0:9000".into());
     let listener = TcpListener::bind(&addr).expect("Cannot bind");
+    info!("Version={}", env!("CARGO_PKG_VERSION"));
     info!("RELAY_START  addr={}", addr);
 
     let waiting: WaitMap    = Arc::new(Mutex::new(HashMap::new()));
