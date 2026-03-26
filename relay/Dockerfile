@@ -1,5 +1,5 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM rust:1.82-slim AS builder
+FROM rust:1.85-bookworm AS builder # Use 1.85 or 'rust:latest'
 
 WORKDIR /build
 
