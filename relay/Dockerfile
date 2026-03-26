@@ -1,5 +1,6 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM rust:1.85-bookworm AS builder # Use 1.85 or 'rust:latest'
+# Use 1.85 or 'rust:latest'
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /build
 
@@ -11,7 +12,7 @@ RUN mkdir src && echo 'fn main(){}' > src/main.rs \
     && rm -rf src
 
 # Now copy the real source and do the final build
-COPY src ./src
+COPY . .
 # Touch main.rs so Cargo knows it changed
 RUN touch src/main.rs && cargo build --release
 
