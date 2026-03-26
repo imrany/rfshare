@@ -291,7 +291,7 @@ fn device_row(
 
     // Hover highlight
     let bg = if resp.hovered() && !selected { tint(p.accent, 12) } else { fill };
-    ui.painter().rect(rect, CornerRadius::same(6), bg, stroke,
+    ui.painter().rect(rect, CornerRadius::same(0), bg, stroke,
         egui::StrokeKind::Inside);
 
     let margin = 12.0f32;
@@ -307,7 +307,7 @@ fn device_row(
         &peer.name.chars().next().unwrap_or('?').to_uppercase().to_string(),
         egui::FontId::proportional(14.0), av_col);
 
-    // ── Name + badges ─────────────────────────────────────────────────────
+    // ── Name ─────────────────────────────────────────────────────
     let name_x = content.left() + 40.0;
     ui.painter().text(
         egui::pos2(name_x, content.center().y - 7.0),
@@ -315,16 +315,6 @@ fn device_row(
         &peer.name,
         egui::FontId::proportional(13.0),
         if selected { p.accent } else { p.text });
-
-    // Recent star badge
-    if is_recent {
-        ui.painter().text(
-            egui::pos2(name_x + peer.name.len() as f32 * 7.5 + 6.0,
-                content.center().y - 7.0),
-            egui::Align2::LEFT_CENTER,
-            "★",
-            egui::FontId::proportional(10.0), p.warn);
-    }
 
     // Subtitle: remote label or "Recently connected"
     let sub = if is_remote { "Remote device".to_string() }
@@ -377,15 +367,6 @@ fn device_row(
     ui.painter().rect_filled(badge_rect, 4.0, tint(type_col, 25));
     ui.painter().text(badge_rect.center(), egui::Align2::CENTER_CENTER,
         type_lbl, egui::FontId::proportional(9.0), type_col);
-
-    // Selected checkmark
-    if selected {
-        ui.painter().text(
-            egui::pos2(content.left() - 4.0, content.center().y),
-            egui::Align2::LEFT_CENTER,
-            icons::ICON_CHECK,
-            egui::FontId::proportional(13.0), p.accent);
-    }
 
     resp
 }
@@ -2035,12 +2016,24 @@ impl App {
                                 self.scan_mode = mode;
                             }
                         }
-
                         ui.add_space(8.0);
-                        let n = self.peers.iter().filter(|p| p.kind == PeerKind::Local).count();
 
+                        let n = self.peers.iter().filter(|p| p.kind == PeerKind::Local).count();
                         // Local mode: filter
                         if self.scan_mode == ScanMode::Local && n > 0 {
+                            let scan_lbl = format!("{}  Rescan", icons::ICON_SEARCH);
+                            ui.add_enabled_ui(!scanning, |ui| {
+                                if ui.add(egui::Button::new(
+                                    RichText::new(&scan_lbl).size(12.0).color(Color32::WHITE))
+                                    .fill(p.surface2).corner_radius(6.0)
+                                    .stroke(Stroke::new(1.0, p.border))
+                                    .min_size(Vec2::new(80.0, 30.0))).clicked()
+                                {
+                                    self.start_scan();
+                                }
+                            });
+                            ui.add_space(8.0);
+
                             egui::Frame::new()
                                 .fill(p.bg)
                                 .stroke(Stroke::new(1.0,
@@ -2217,7 +2210,6 @@ impl App {
                             ui.label(RichText::new("Type").size(10.5).strong().color(p.text_faint));
                         });
                     });
-                ui.add_space(4.0);
 
                 for (peer_idx, peer) in &filtered {
                     let is_recent = peer.addr.to_string() == self.saved_peer_addr;
@@ -2507,6 +2499,7 @@ impl App {
                             {
                                 self.scan_mode = ScanMode::Local;
                                 self.tab = Tab::Scan;
+                                self.start_scan();
                             }
                         });
                     });
@@ -4407,6 +4400,7 @@ fn hostname() -> String {
         .trim()
         .to_string()
 }
+
 fn notify(title: &str, body: &str) -> Result<(), ()> {
     #[cfg(target_os = "linux")]
     {
@@ -4427,21 +4421,27 @@ fn notify(title: &str, body: &str) -> Result<(), ()> {
     {
         use std::os::windows::process::CommandExt;
         const CNW: u32 = 0x08000000;
+        // Use a known system AppID
+        let app_id = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+
         let sc = format!(
             "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]>$null;\
-         $t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);\
-         $t.SelectSingleNode('//text[@id=1]').InnerText='{}';\
-         $t.SelectSingleNode('//text[@id=2]').InnerText='{}';\
-         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('rfshare').Show([Windows.UI.Notifications.ToastNotification]::new($t))",
-            title, body
+             $t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);\
+             $t.SelectSingleNode('//text[@id=1]').InnerText='{}';\
+             $t.SelectSingleNode('//text[@id=2]').InnerText='{}';\
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{}').Show([Windows.UI.Notifications.ToastNotification]::new($t))",
+            title, body, app_id
         );
+
         let _ = std::process::Command::new("powershell")
             .args(["-WindowStyle", "Hidden", "-Command", &sc])
             .creation_flags(CNW)
             .spawn();
     }
+
     Ok(())
 }
+
 fn open_folder(p: &std::path::Path) {
     let d = p.parent().unwrap_or(p);
     #[cfg(target_os = "linux")]
@@ -4454,13 +4454,14 @@ fn open_folder(p: &std::path::Path) {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("explorer")
+        std::process::Command::new("cmd")
+            .args(["/c", "start", ""]) // "" is a dummy title for 'start'
             .arg(d)
             .creation_flags(0x08000000)
             .spawn();
     }
 }
+
 fn open_url(url: &str) {
     #[cfg(target_os = "linux")]
     {
@@ -4480,6 +4481,7 @@ fn open_url(url: &str) {
             .spawn();
     }
 }
+
 fn format_size(b: u64) -> String {
     const U: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut s = b as f64;
@@ -4494,6 +4496,7 @@ fn format_size(b: u64) -> String {
         format!("{:.1} {}", s, U[i])
     }
 }
+
 fn file_icon(name: &str) -> &'static str {
     let ext = std::path::Path::new(name)
         .extension()
