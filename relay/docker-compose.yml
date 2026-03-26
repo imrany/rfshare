@@ -1,0 +1,33 @@
+services:
+  relay:
+    image: ghcr.io/imrany/rfshare-relay:latest
+    container_name: rfshare-relay
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      # Override bind address if needed (e.g. to listen only on a specific interface)
+      - RELAY_ADDR=0.0.0.0:9000
+    command: ["0.0.0.0:9000"]
+    # Optional: limit resources so a runaway connection loop can't kill the host
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.5"
+    healthcheck:
+      # TCP-level check — relay accepts the connection and we immediately close it
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'echo > /dev/tcp/localhost/9000' 2>/dev/null && echo ok",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
