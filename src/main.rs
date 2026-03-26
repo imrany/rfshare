@@ -32,8 +32,8 @@ const MAGIC_DATA: u8 = 0x03;
 const MAGIC_DONE: u8 = 0x04;
 const MAGIC_SKIP: u8 = 0x05; // receiver already has this version — sender should skip
 const SYNC_POLL_MS: u64 = 2_000; // how often the sync watcher polls each folder
-const RELAY_HOST: &str = "relay.rfshare.dev";
-const RELAY_PORT: u16  = 9000;
+const RELAY_HOST: &str = "relay.triple-ts-mediclinic.com";
+const RELAY_PORT: u16  = 443;
 
 /// Generate a random 8-char session code like "A3F7-K2M9"
 fn gen_session_code() -> String {
@@ -1905,7 +1905,7 @@ impl eframe::App for App {
                             ).frame(false)
                         );
                         if resp.clicked() {
-                            open_url(format!("https://github.com/imrany/{}/releases/latest", env!("CARGO_PKG_NAME")).as_str());
+                            open_url(format!("{}/releases/latest", env!("CARGO_PKG_REPOSITORY")).as_str());
                         }
                     }
 
@@ -3477,9 +3477,9 @@ impl App {
             );
             ui.add_space(16.0);
             for (label, url) in [
-                ("GitHub", format!("https://github.com/imrany/{}", env!("CARGO_PKG_NAME"))),
-                ("Changelog", format!("https://github.com/imrany/{}/releases", env!("CARGO_PKG_NAME"))),
-                ("Bug Report", format!("https://github.com/imrany/{}/issues", env!("CARGO_PKG_NAME"))),
+                ("GitHub", format!("{}", env!("CARGO_PKG_REPOSITORY"))),
+                ("Changelog", format!("{}/releases", env!("CARGO_PKG_REPOSITORY"))),
+                ("Bug Report", format!("{}/issues", env!("CARGO_PKG_REPOSITORY"))),
             ] {
                 if ui.add(pill_btn(label, p.accent)).clicked() {
                     open_url(url.as_str());

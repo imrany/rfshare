@@ -91,12 +91,12 @@ Adds rfshare to your PATH, creates a Start Menu shortcut, and registers it in Ad
 
 **Linux / macOS**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash -s -- --version v0.8.0
+curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash -s -- --version v0.9.0
 ```
 
 **Windows**
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.ps1))) -Version v0.8.0
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.ps1))) -Version v0.9.0
 ```
 
 ### Uninstall
