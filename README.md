@@ -1,13 +1,14 @@
 # RFSHARE
-**rfshare** is a P2P encrypted file-sharing application built with Rust and the egui framework. It leverages a modern cryptographic stack, including X25519 for key exchange and AES-256-GCM for authenticated data encryption. [1, 2, 3] 
-Core Architecture and Features
+**rfshare** is a P2P encrypted file-sharing application built with Rust and the egui framework. It leverages a modern cryptographic stack, including X25519 for key exchange and AES-256-GCM for authenticated data encryption. 
 
-* Peer Discovery: The application uses a dedicated UDP discovery port (44444) to find other instances of the software on the local network using a "RFSHARE_DISCOVER" broadcast message.
-* Encrypted Transfers: After discovery, peers establish a secure connection on port 44445. It implements an ephemeral key exchange where a shared secret is derived to encrypt file chunks with AES-GCM.
+## Core Architecture and Features
+
 * Remote sharing: Support remote file sharing and folder syncing. You can share around the global.
 * Folder Synchronization: The "Pro" version (validated via a simple salted hash mechanism) supports automated folder monitoring, where it periodically polls specific directories for changes and syncs them with a linked device.
+* LAN Device Discovery: The application uses a dedicated UDP discovery port (44444) to find other instances of the software on the local network using a "RFSHARE_DISCOVER" broadcast message.
+* Encrypted Transfers: After discovery, peers establish a secure connection on port 44445. It implements an ephemeral key exchange where a shared secret is derived to encrypt file chunks with AES-GCM.
 * Modern UI: The interface uses egui with a custom color palette (supporting Light/Dark modes) and integrates Material Design icons via the [egui_material_icons](https://crates.io/crates/egui_material_icons) crate.
-* Persistence: User preferences, selected peer addresses, and transfer history are stored locally in the OS's config directory (e.g., AppData on Windows) using simple JSON-free flat files and CSV formats. [1, 4, 5, 6, 7] 
+* Persistence: User preferences, selected peer addresses, and transfer history are stored locally in the OS's config directory (e.g., AppData on Windows) using simple JSON-free flat files and CSV formats.
 
 **What it does in plain terms:** it lets two computers on the same Wi-Fi or LAN send files to each other directly — no internet, no cloud, no accounts, no cables.
 
