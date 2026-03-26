@@ -135,7 +135,7 @@ fn relay_connect(code: &str, tx: std::sync::mpsc::Sender<RelayMsg>) {
 
 // ─── Persistence helpers ─────────────────────────────────────────────────────
 fn prefs_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("rfshare").join("prefs.json"))
+    dirs::config_dir().map(|d| d.join(env!("CARGO_PKG_NAME")).join("prefs.json"))
 }
 
 /// Minimal JSON-free prefs. Format:
@@ -249,7 +249,7 @@ fn fetch_latest_version() -> Option<String> {
     let mut stream = std::net::TcpStream::connect(("github.com", 80)).ok()?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
     write!(stream,
-        "GET /imrany/rfshare/releases/latest HTTP/1.1\r\nHost: github.com\r\nUser-Agent: rfshare\r\nConnection: close\r\n\r\n"
+        "GET /imrany/{}/releases/latest HTTP/1.1\r\nHost: github.com\r\nUser-Agent: {}\r\nConnection: close\r\n\r\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_NAME")
     ).ok()?;
     for line in BufReader::new(stream).lines().take(20).flatten() {
         if line.to_ascii_lowercase().starts_with("location:") {
@@ -387,7 +387,7 @@ struct License {
 
 impl License {
     fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("rfshare").join("license"))
+        dirs::config_dir().map(|d| d.join(env!("CARGO_PKG_NAME")).join("license"))
     }
     fn load() -> Self {
         let path = Self::config_path();
@@ -541,7 +541,7 @@ impl HistoryEntry {
 }
 
 fn history_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("rfshare").join("history.csv"))
+    dirs::config_dir().map(|d| d.join(env!("CARGO_PKG_NAME")).join("history.csv"))
 }
 fn load_history() -> Vec<HistoryEntry> {
     let Some(path) = history_path() else {
@@ -1678,7 +1678,7 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            RichText::new("rfshare Pro")
+                            RichText::new(format!("{} Pro", env!("CARGO_PKG_NAME")))
                                 .size(20.0)
                                 .strong()
                                 .color(p2.pro),
@@ -1693,10 +1693,10 @@ impl eframe::App for App {
 
                         let feat_w = 300.0f32;
                         for (icon, feat) in [
+                            (icons::ICON_GLOBE, "Remote file sharing"),
                             ("📁", "Folder sync — auto-send new files in a folder"),
                             ("🏢", "Unlimited devices  /  org license"),
                             ("🔐", "End-to-end encrypted transfers"),
-                            ("⚡", "Priority support"),
                         ] {
                             ui.allocate_ui_with_layout(
                                 Vec2::new(feat_w, 30.0),
@@ -1752,6 +1752,7 @@ impl eframe::App for App {
                         {
                             self.show_upgrade = false;
                             self.tab = Tab::Settings;
+                            self.settings_tab = SettingsTab::License;
                         }
                         ui.add_space(4.0);
                         if ui
@@ -1791,7 +1792,7 @@ impl eframe::App for App {
                             .corner_radius(7.0),
                     );
                     ui.add_space(6.0);
-                    ui.label(RichText::new("rfshare").size(15.0).strong().color(p.text));
+                    ui.label(RichText::new(env!("CARGO_PKG_NAME")).size(15.0).strong().color(p.text));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let tab_defs: &[(&str, Tab, bool)] = &[
@@ -1891,7 +1892,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(
-                        RichText::new(format!("rfshare v{}", self.version))
+                        RichText::new(format!("{} v{}", env!("CARGO_PKG_NAME"), self.version))
                             .size(10.5).color(p.text_faint),
                     );
 
@@ -1899,12 +1900,12 @@ impl eframe::App for App {
                         ui.add_space(6.0);
                         let resp = ui.add(
                             egui::Button::new(
-                                RichText::new(format!("↑ {} available", latest))
+                                RichText::new(format!("{} {} available",icons::ICON_ARROW_UPWARD, latest))
                                     .size(10.0).color(p.warn).strong()
                             ).frame(false)
                         );
                         if resp.clicked() {
-                            open_url("https://github.com/imrany/rfshare/releases/latest");
+                            open_url(format!("https://github.com/imrany/{}/releases/latest", env!("CARGO_PKG_NAME")).as_str());
                         }
                     }
 
@@ -1946,25 +1947,19 @@ impl eframe::App for App {
                                 "PRO", egui::FontId::proportional(8.0), p.pro);
                             ui.add_space(6.0);
                         }
-                        if let Some(peer) = self.selected_peer() {
-                            ui.painter().circle_filled(
-                                ui.cursor().left_top() + Vec2::new(4.0, 7.0),
-                                4.0, p.success);
-                            ui.add_space(12.0);
-                            ui.label(
-                                RichText::new(&peer.name)
-                                    .size(10.5).color(p.text_dim),
-                            );
-                        } else {
-                            ui.painter().circle_filled(
-                                ui.cursor().left_top() + Vec2::new(4.0, 7.0),
-                                4.0, p.text_faint);
-                            ui.add_space(12.0);
-                            ui.label(
-                                RichText::new("No device connected")
-                                    .size(10.5).color(p.text_faint),
-                            );
-                        }
+
+                        ui.label({
+                            let device = if self.this_hostname.is_empty() {
+                                &self.this_ip
+                            } else {
+                                &self.this_hostname
+                            };
+
+                            RichText::new(device)
+                                .size(10.5)
+                                .color(p.text_dim)
+                        });
+
                     });
                 });
             });
@@ -1996,27 +1991,29 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        // ── Local / Remote toggle ─────────────────────────────
-                        for (label, mode) in [
-                            ("  Local  ", ScanMode::Local),
-                            ("  Remote  ", ScanMode::Remote),
-                        ] {
-                            let active = self.scan_mode == mode;
-                            let (fill, text_col) = if active {
-                                (p.accent, Color32::WHITE)
-                            } else {
-                                (p.surface2, p.text_dim)
-                            };
-                            if ui.add(egui::Button::new(
-                                RichText::new(label).size(12.0).color(text_col))
-                                .fill(fill)
-                                .corner_radius(6.0)
-                                .min_size(Vec2::new(0.0, 30.0))).clicked()
-                            {
-                                self.scan_mode = mode;
+                        if self.is_pro() {
+                            // ── Local / Remote toggle ─────────────────────────────
+                            for (label, mode) in [
+                                ("  Local  ", ScanMode::Local),
+                                ("  Remote  ", ScanMode::Remote),
+                            ] {
+                                let active = self.scan_mode == mode;
+                                let (fill, text_col) = if active {
+                                    (p.accent, Color32::WHITE)
+                                } else {
+                                    (p.surface2, p.text_dim)
+                                };
+                                if ui.add(egui::Button::new(
+                                    RichText::new(label).size(12.0).color(text_col))
+                                    .fill(fill)
+                                    .corner_radius(6.0)
+                                    .min_size(Vec2::new(0.0, 30.0))).clicked()
+                                {
+                                    self.scan_mode = mode;
+                                }
                             }
+                            ui.add_space(8.0);
                         }
-                        ui.add_space(8.0);
 
                         let n = self.peers.iter().filter(|p| p.kind == PeerKind::Local).count();
                         // Local mode: filter
@@ -2149,7 +2146,7 @@ impl App {
                     .size(14.0).strong().color(p.text));
                 ui.add_space(6.0);
                 ui.label(RichText::new(
-                    "Devices running rfshare on the same Wi-Fi will appear here.")
+                    format!("Devices running {} on the same Wi-Fi will appear here.", env!("CARGO_PKG_NAME")))
                     .size(12.0).color(p.text_dim));
                 ui.add_space(20.0);
                 if ui.add(big_btn(&format!("  {}  Scan  ", icons::ICON_SEARCH), p.accent))
@@ -2229,9 +2226,11 @@ impl App {
                     ui.label(RichText::new("No devices found")
                         .size(14.0).strong().color(p.text));
                     ui.add_space(4.0);
-                    ui.label(RichText::new(
-                        "Make sure the other device is on the same Wi-Fi and running rfshare")
-                        .size(11.5).color(p.text_dim));
+                    ui.label({
+                        RichText::new(
+                            format!("Make sure the other device is on the same Wi-Fi and running {}", env!("CARGO_PKG_NAME"))
+                        ).size(11.5).color(p.text_dim)
+                    });
                     ui.add_space(12.0);
                     if ui.add(pill_btn("Scan again", p.accent)).clicked() {
                         self.start_scan();
@@ -2693,8 +2692,6 @@ impl App {
                 }
             } else {
                 ui.horizontal(|ui| {
-                    check_item(ui, &p, peer_ok, "Device selected");
-                    ui.add_space(20.0);
                     check_item(ui, &p, !self.queue.is_empty(), "Files added");
                 });
                 ui.add_space(12.0);
@@ -3365,7 +3362,7 @@ impl App {
                         ui.add_space(10.0);
                         ui.vertical(|ui| {
                             ui.label(
-                                RichText::new("rfshare Pro — Active")
+                                RichText::new(format!("{} Pro — Active", env!("CARGO_PKG_NAME")))
                                     .strong()
                                     .size(14.0)
                                     .color(p.pro),
@@ -3436,7 +3433,7 @@ impl App {
                         };
                         self.license.save();
                         self.license_msg =
-                            Some(("Pro activated! Enjoy rfshare Pro.".into(), false));
+                            Some((format!("Pro activated! Enjoy {} Pro.", env!("CARGO_PKG_NAME")).into(), false));
                         self.license_key_buf.clear();
                     } else {
                         self.license_msg =
@@ -3446,7 +3443,7 @@ impl App {
             });
             ui.add_space(8.0);
             if ui.add(pill_btn("Buy a license", p.pro)).clicked() {
-                open_url("https://rfshare.imrany.dev/pro");
+                open_url("https://github.com/sponsors/imrany");
             }
         }
         if let Some((msg, is_err)) = &self.license_msg {
@@ -3466,7 +3463,7 @@ impl App {
                     .corner_radius(14.0),
             );
             ui.add_space(10.0);
-            ui.label(RichText::new("rfshare").strong().size(18.0).color(p.text));
+            ui.label(RichText::new(env!("CARGO_PKG_NAME").to_string()).strong().size(18.0).color(p.text));
             ui.label(
                 RichText::new(format!("v{}", self.version.clone()))
                     .size(12.0)
@@ -3474,18 +3471,18 @@ impl App {
             );
             ui.add_space(6.0);
             ui.label(
-                RichText::new("Fast, encrypted LAN file transfers.")
+                RichText::new(env!("CARGO_PKG_DESCRIPTION").to_string())
                     .size(12.0)
                     .color(p.text_dim),
             );
             ui.add_space(16.0);
             for (label, url) in [
-                ("GitHub", "https://github.com/imrany/rfshare"),
-                ("Changelog", "https://github.com/imrany/rfshare/releases"),
-                ("Bug Report", "https://github.com/imrany/rfshare/issues"),
+                ("GitHub", format!("https://github.com/imrany/{}", env!("CARGO_PKG_NAME"))),
+                ("Changelog", format!("https://github.com/imrany/{}/releases", env!("CARGO_PKG_NAME"))),
+                ("Bug Report", format!("https://github.com/imrany/{}/issues", env!("CARGO_PKG_NAME"))),
             ] {
                 if ui.add(pill_btn(label, p.accent)).clicked() {
-                    open_url(url);
+                    open_url(url.as_str());
                 }
                 ui.add_space(6.0);
             }
@@ -4010,7 +4007,7 @@ fn discovery_responder(_: Arc<Mutex<RecvState>>) {
 fn derive_key(shared: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(shared);
-    h.update(b"rfshare-v1");
+    h.update(format!("{}-v1", env!("CARGO_PKG_NAME")).as_bytes());
     h.finalize().into()
 }
 fn encrypt_chunk(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>, String> {
@@ -4333,7 +4330,7 @@ fn receive_file_resumable(
         return Err(format!("Size mismatch: {} vs {}", file_size, received));
     }
     let _ = notify(
-        "rfshare — File Received",
+        &format!("{} — File Received", env!("CARGO_PKG_NAME")),
         &format!(
             "'{}' saved to {}",
             truncate_filename(&name, 45),
@@ -4522,7 +4519,7 @@ fn file_icon(name: &str) -> &'static str {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("rfshare")
+            .with_title(format!("{}", env!("CARGO_PKG_NAME")))
             .with_inner_size([560.0, 680.0])
             .with_min_inner_size([340.0, 480.0])
             .with_maximize_button(false)
@@ -4535,7 +4532,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "rfshare",
+        env!("CARGO_PKG_NAME"),
         options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
