@@ -34,6 +34,22 @@ cd rfshare/relay
 cargo build --release
 # Run on port 443 for firewall friendliness, or 9000
 sudo ./target/release/relay 0.0.0.0:443
+``` 
+
+Using Docker
+```bash
+docker pull ghcr.io/imrany/rfshare-relay:latest
+
+# Run the relay server in a Docker container
+# Expose port 443 (for firewall friendliness) or 9000
+# The Docker image listens on port 9000 internally
+docker run -d --restart unless-stopped -p 443:9000 --name rfshare-relay ghcr.io/imrany/rfshare-relay:latest
+
+# To run on port 9000 instead:
+# docker run -d --restart unless-stopped -p 9000:9000 --name rfshare-relay ghcr.io/imrany/rfshare-relay:latest
+
+# To stop the container later:
+# docker stop rfshare-relay
 ```
 
 **Changed constant:** `RELAY_HOST` and `RELAY_PORT` — update these to match your deployed relay server before shipping
