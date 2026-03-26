@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "relay"
+name = "rfshare-relay"
 version = "0.1.0"
