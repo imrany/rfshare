@@ -4451,12 +4451,15 @@ fn open_folder(p: &std::path::Path) {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", ""]) // "" is a dummy title for 'start'
+        use std::os::windows::process::CommandExt;
+
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", ""])
             .arg(d)
-            .creation_flags(0x08000000)
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .spawn();
     }
+
 }
 
 fn open_url(url: &str) {
