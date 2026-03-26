@@ -4,6 +4,7 @@ Core Architecture and Features
 
 * Peer Discovery: The application uses a dedicated UDP discovery port (44444) to find other instances of the software on the local network using a "RFSHARE_DISCOVER" broadcast message.
 * Encrypted Transfers: After discovery, peers establish a secure connection on port 44445. It implements an ephemeral key exchange where a shared secret is derived to encrypt file chunks with AES-GCM.
+* Remote sharing: Support remote file sharing and folder syncing. You can share around the global.
 * Folder Synchronization: The "Pro" version (validated via a simple salted hash mechanism) supports automated folder monitoring, where it periodically polls specific directories for changes and syncs them with a linked device.
 * Modern UI: The interface uses egui with a custom color palette (supporting Light/Dark modes) and integrates Material Design icons via the [egui_material_icons](https://crates.io/crates/egui_material_icons) crate.
 * Persistence: User preferences, selected peer addresses, and transfer history are stored locally in the OS's config directory (e.g., AppData on Windows) using simple JSON-free flat files and CSV formats. [1, 4, 5, 6, 7] 
