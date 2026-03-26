@@ -1,5 +1,6 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-# Use 1.94 or 'rust:latest'
+# Build context must be the repo root so the workspace Cargo.toml is available.
+# The relay crate lives at ./relay/  (source at ./relay/src/).
 FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
@@ -26,11 +27,6 @@ COPY relay/src ./relay/src
 RUN touch relay/src/main.rs \
     && cargo build --release --manifest-path relay/Cargo.toml
 
-# Locate the produced binary regardless of its name and copy it to a fixed path
-RUN BIN=$(cargo metadata --manifest-path relay/Cargo.toml --no-deps --format-version 1 \
-          | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4) \
-    && cp target/release/"$BIN" target/release/relay-server
-
 # ── Stage 2: minimal runtime image ───────────────────────────────────────────
 FROM debian:bookworm-slim
 
@@ -41,14 +37,14 @@ RUN apt-get update \
 # Run as a dedicated non-root user
 RUN useradd --system --no-create-home --shell /usr/sbin/nologin relay
 
-COPY --from=builder /build/target/release/relay-server /usr/local/bin/relay-server
+COPY --from=builder /build/target/release/rfshare-relay /usr/local/bin/rfshare-relay
 
-RUN chmod +x /usr/local/bin/relay-server
+RUN chmod +x /usr/local/bin/rfshare-relay
 
 USER relay
 
 # Port the relay listens on (must match RELAY_PORT in the rfshare client)
 EXPOSE 9000
 
-ENTRYPOINT ["relay-server"]
+ENTRYPOINT ["rfshare-relay"]
 CMD ["0.0.0.0:9000"]

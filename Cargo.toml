@@ -52,3 +52,8 @@ icon              = ["assets/icon.png", "assets/icon.ico"]
 [package.metadata.bundle.linux]
 exec       = "rfshare"
 categories = ["Network", "FileTransfer", "Utility", "RemoteAccess"]
+
+[workspace]
+members = [
+    "relay",
+]
