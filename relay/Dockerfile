@@ -1,6 +1,6 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-# Use 1.85 or 'rust:latest'
-FROM rust:1.85-bookworm AS builder
+# Use 1.94 or 'rust:latest'
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 
