@@ -10,7 +10,7 @@ use egui_material_icons::icons;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write, BufRead, BufReader,};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -88,83 +88,111 @@ fn gen_session_code() -> String {
     code
 }
 
-/// Receiver: connect to relay, register a code, wait for sender to join
 fn relay_listen(tx: std::sync::mpsc::Sender<RelayMsg>) {
     let code = gen_session_code();
     let _ = tx.send(RelayMsg::Code(code.clone()));
 
-    let mut stream = match std::net::TcpStream::connect((RELAY_HOST, RELAY_PORT)) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.send(RelayMsg::Error(format!("Cannot reach relay: {}", e)));
-            return;
+    match std::net::TcpStream::connect((RELAY_HOST, RELAY_PORT)) {
+        Ok(mut stream) => {
+            let request = format!(
+                "GET /receiver/{} HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n",
+                code, RELAY_HOST
+            );
+
+            if stream.write_all(request.as_bytes()).is_err() {
+                let _ = tx.send(RelayMsg::Error("Write error".into()));
+                return;
+            }
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut response = String::new();
+
+            // Read HTTP status line
+            if reader.read_line(&mut response).is_err() {
+                let _ = tx.send(RelayMsg::Error("Read error".into()));
+                return;
+            }
+
+            // Read headers until empty line
+            let mut line = String::new();
+            while let Ok(len) = reader.read_line(&mut line) {
+                if len == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+
+            // Read the body (our command)
+            let mut body = String::new();
+            if reader.read_line(&mut body).is_ok() {
+                if body.starts_with("RECEIVER") {
+                    let peer = "remote".to_string();
+                    let _ = tx.send(RelayMsg::Paired { peer: peer.clone() });
+
+                    // The connection is now established - we need to keep it alive
+                    let holder = Arc::new(Mutex::new(Some(stream)));
+                    let _ = tx.send(RelayMsg::Ready(holder));
+                }
+            }
         }
-    };
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(120))).ok();
-
-    // Register as receiver
-    if writeln!(stream, "RECEIVER {}", code).is_err() {
-        let _ = tx.send(RelayMsg::Error("Relay write error".into()));
-        return;
-    }
-    let _ = stream.flush();
-
-    // Wait for PAIRED response (up to 2 minutes)
-    let mut buf = String::new();
-    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-    use std::io::BufRead;
-    match reader.read_line(&mut buf) {
-        Ok(0) => { let _ = tx.send(RelayMsg::Error("Relay closed".into())); return; }
-        Err(e) => { let _ = tx.send(RelayMsg::Error(format!("Relay: {}", e))); return; }
-        Ok(_) => {}
-    }
-    let line = buf.trim();
-    if line.starts_with("PAIRED") {
-        let peer = line.strip_prefix("PAIRED ").unwrap_or("remote").to_string();
-        let _ = tx.send(RelayMsg::Paired { peer });
-        // Hand off the raw stream for the file transfer
-        let holder = Arc::new(Mutex::new(Some(stream)));
-        let _ = tx.send(RelayMsg::Ready(holder));
-    } else {
-        let _ = tx.send(RelayMsg::Error(format!("Unexpected relay response: {}", line)));
+        Err(e) => {
+            let _ = tx.send(RelayMsg::Error(format!("Cannot connect: {}", e)));
+        }
     }
 }
 
-/// Sender: connect to relay using the code the receiver shared
 fn relay_connect(code: &str, tx: std::sync::mpsc::Sender<RelayMsg>) {
-    let mut stream = match std::net::TcpStream::connect((RELAY_HOST, RELAY_PORT)) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.send(RelayMsg::Error(format!("Cannot reach relay: {}", e)));
-            return;
+    let code = code.trim();
+    match std::net::TcpStream::connect((RELAY_HOST, RELAY_PORT)) {
+        Ok(mut stream) => {
+            let request = format!(
+                "GET /sender/{} HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n",
+                code, RELAY_HOST
+            );
+
+            if stream.write_all(request.as_bytes()).is_err() {
+                let _ = tx.send(RelayMsg::Error("Write error".into()));
+                return;
+            }
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut response = String::new();
+
+            if reader.read_line(&mut response).is_err() {
+                let _ = tx.send(RelayMsg::Error("Read error".into()));
+                return;
+            }
+
+            // Read headers
+            let mut line = String::new();
+            while let Ok(len) = reader.read_line(&mut line) {
+                if len == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+
+            // Read the body
+            let mut body = String::new();
+            if reader.read_line(&mut body).is_ok() {
+                if body.starts_with("SENDER") {
+                    let peer = "remote".to_string();
+                    let _ = tx.send(RelayMsg::Paired { peer: peer.clone() });
+
+                    let holder = Arc::new(Mutex::new(Some(stream)));
+                    let _ = tx.send(RelayMsg::Ready(holder));
+                }
+            }
         }
-    };
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
-
-    if writeln!(stream, "SENDER {}", code.trim()).is_err() {
-        let _ = tx.send(RelayMsg::Error("Relay write error".into()));
-        return;
-    }
-    let _ = stream.flush();
-
-    let mut buf = String::new();
-    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-    use std::io::BufRead;
-    match reader.read_line(&mut buf) {
-        Ok(0) => { let _ = tx.send(RelayMsg::Error("Relay closed connection".into())); return; }
-        Err(e) => { let _ = tx.send(RelayMsg::Error(format!("Relay: {}", e))); return; }
-        Ok(_) => {}
-    }
-    let line = buf.trim();
-    if line.starts_with("PAIRED") {
-        let peer = line.strip_prefix("PAIRED ").unwrap_or("remote").to_string();
-        let _ = tx.send(RelayMsg::Paired { peer: peer.clone() });
-        let holder = Arc::new(Mutex::new(Some(stream)));
-        let _ = tx.send(RelayMsg::Ready(holder));
-    } else if line == "NOT_FOUND" {
-        let _ = tx.send(RelayMsg::Error("Code not found or expired".into()));
-    } else {
-        let _ = tx.send(RelayMsg::Error(format!("Unexpected: {}", line)));
+        Err(e) => {
+            let _ = tx.send(RelayMsg::Error(format!("Cannot connect: {}", e)));
+        }
     }
 }
 
@@ -280,7 +308,6 @@ fn toggle_switch(ui: &mut egui::Ui, p: &Pal, on: bool) -> egui::Response {
 }
 
 fn fetch_latest_version() -> Option<String> {
-    use std::io::{BufRead, BufReader, Write};
     let mut stream = std::net::TcpStream::connect(("github.com", 80)).ok()?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
     write!(stream,
@@ -317,9 +344,9 @@ fn device_row(
     is_remote: bool,
 ) -> egui::Response {
     let fill = if selected { tint(p.accent, 30) }
-               else        { Color32::TRANSPARENT };
+                else        { Color32::TRANSPARENT };
     let stroke = if selected { Stroke::new(1.0, tint(p.accent, 60)) }
-                 else        { Stroke::NONE };
+                    else        { Stroke::NONE };
 
     let (rect, resp) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), 44.0), Sense::click());
@@ -1136,10 +1163,7 @@ impl App {
             self.show_upgrade = true;
             return;
         }
-        if self.sync_jobs.is_empty() {
-            return;
-        }
-        if self.sync_active {
+        if self.sync_jobs.is_empty() || self.sync_active {
             return;
         }
 
@@ -1154,11 +1178,23 @@ impl App {
                 .map(|_| std::collections::HashMap::new())
                 .collect();
 
+            let mut last_scan = std::time::Instant::now();
+
             loop {
+                // Throttle scanning to avoid CPU spikes
+                if last_scan.elapsed() < std::time::Duration::from_millis(SYNC_POLL_MS) {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                last_scan = std::time::Instant::now();
+
                 for (job_idx, job) in jobs.iter().enumerate() {
                     let Ok(entries) = fs::read_dir(&job.folder) else {
                         continue;
                     };
+
+                    // Collect files to process
+                    let mut files_to_send = Vec::new();
 
                     for entry in entries.flatten() {
                         let path = entry.path();
@@ -1167,7 +1203,6 @@ impl App {
                         }
 
                         let key = path.to_string_lossy().to_string();
-
                         let current_mtime = fs::metadata(&path)
                             .and_then(|m| m.modified())
                             .map(|t| {
@@ -1189,30 +1224,32 @@ impl App {
                             .to_string_lossy()
                             .to_string();
                         let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        let tx2 = tx.clone();
-                        let nm = name.clone();
-                        let _ = tx2.send(SyncMsg::FileFound { name: nm.clone() });
+
+                        files_to_send.push((path, key, name, size, current_mtime));
+                    }
+
+                    // Send files with a small delay between each
+                    for (path, key, name, size, current_mtime) in files_to_send {
+                        let _ = tx.send(SyncMsg::FileFound { name: name.clone() });
 
                         match send_file_sync(&path, &name, size, current_mtime, job.peer_addr) {
                             Ok(SyncResult::Sent) => {
-                                let key_clone = key.clone();
-                                job_mtimes[job_idx].insert(key, current_mtime);
-                                let _ = tx2.send(SyncMsg::FileSent {
-                                    name: nm,
-                                    path: key_clone,
-                                });
+                                job_mtimes[job_idx].insert(key.clone(), current_mtime);
+                                let _ = tx.send(SyncMsg::FileSent { name, path: key });
                             }
                             Ok(SyncResult::Skipped) => {
                                 job_mtimes[job_idx].insert(key, current_mtime);
-                                let _ = tx2.send(SyncMsg::FileSkipped { name: nm });
+                                let _ = tx.send(SyncMsg::FileSkipped { name });
                             }
                             Err(e) => {
-                                let _ = tx2.send(SyncMsg::FileError { name: nm, error: e });
+                                let _ = tx.send(SyncMsg::FileError { name, error: e });
                             }
                         }
+
+                        // Small delay between file sends
+                        thread::sleep(std::time::Duration::from_millis(50));
                     }
                 }
-                thread::sleep(std::time::Duration::from_millis(SYNC_POLL_MS));
             }
         });
     }
@@ -1280,6 +1317,22 @@ impl App {
     }
 
     fn poll(&mut self) {
+        // Use try_lock instead of lock to avoid blocking
+        if let Ok(mut recv_state) = self.recv_state.try_lock() {
+            // Process received files
+            for file in recv_state.files.iter_mut() {
+                if !file.seen && self.notify_on_receive {
+                    let _ = notify(&format!("File Received"), &file.name);
+                    file.seen = true;
+
+                    if self.auto_open_folder {
+                        open_folder(&file.path);
+                    }
+                }
+            }
+        }
+
+        // Process scan results with try_recv
         if let Some(rx) = &self.scan_rx {
             if let Ok(peers) = rx.try_recv() {
                 self.scan_rx = None;
@@ -1295,7 +1348,7 @@ impl App {
                     })
                     .collect();
 
-                // Append persisted manual peers so they always appear in the list
+                // Append persisted manual peers
                 for mp in &self.manual_peers {
                     if !self.peers.iter().any(|p| p.addr == mp.addr) {
                         self.peers.push(mp.clone());
@@ -1321,75 +1374,64 @@ impl App {
             }
         }
 
+        // Process queue messages with non-blocking
         if let Some(rx) = &self.queue_rx {
-            let mut done = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(QueueMsg::Progress { index, progress }) => {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    QueueMsg::Progress { index, progress } => {
                         if let Some(item) = self.queue.get_mut(index) {
                             item.progress = Some(progress);
                         }
                     }
-                    Ok(QueueMsg::Done { index }) => {
+                    QueueMsg::Done { index } => {
                         if let Some(item) = self.queue.get_mut(index) {
                             item.progress = Some(1.0);
                             self.session_sent_bytes += item.size;
                             self.session_sent_files += 1;
                         }
                     }
-                    Ok(QueueMsg::Failed { index, error }) => {
+                    QueueMsg::Failed { index, error } => {
                         if let Some(item) = self.queue.get_mut(index) {
                             item.error = Some(error);
                             item.progress = None;
                         }
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        done = true;
-                        break;
-                    }
                 }
-            }
-            if done {
-                self.queue_rx = None;
-                self.history = load_history();
             }
         }
 
+        // Process sync messages with non-blocking
         if let Some(rx) = &self.sync_rx {
-            let mut disconnected = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(SyncMsg::FileFound { name }) => {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    SyncMsg::FileFound { name } => {
                         self.sync_log.push(format!("... sending {}", name));
+                        if self.sync_log.len() > 100 {
+                            self.sync_log.drain(0..50);
+                        }
                     }
-                    Ok(SyncMsg::FileSent { name, .. }) => {
-                        let placeholder = format!("... sending {}", name);
-                        self.sync_log.retain(|l| l != &placeholder);
+                    SyncMsg::FileSent { name, .. } => {
+                        self.sync_log.retain(|l| !l.contains(&format!("... sending {}", name)));
                         self.sync_log.push(format!("OK {}", name));
+                        if self.sync_log.len() > 100 {
+                            self.sync_log.drain(0..50);
+                        }
                     }
-                    Ok(SyncMsg::FileSkipped { name }) => {
-                        let placeholder = format!("... sending {}", name);
-                        self.sync_log.retain(|l| l != &placeholder);
-                    }
-                    Ok(SyncMsg::FileError { name, error }) => {
-                        let placeholder = format!("... sending {}", name);
-                        self.sync_log.retain(|l| l != &placeholder);
+                    SyncMsg::FileError { name, error } => {
+                        self.sync_log.retain(|l| !l.contains(&format!("... sending {}", name)));
                         self.sync_log.push(format!("ERR {} — {}", name, error));
+                        if self.sync_log.len() > 100 {
+                            self.sync_log.drain(0..50);
+                        }
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
+                    SyncMsg::FileSkipped { name } => {
+                        self.sync_log.retain(|l| !l.contains(&format!("... sending {}", name)));
                     }
                 }
             }
-            if disconnected {
-                self.sync_rx = None;
-                self.sync_active = false;
-            }
         }
 
+        // Process update checker
         if let Some(rx) = &self.update_rx {
             if let Ok(v) = rx.try_recv() {
                 self.update_available = v;
@@ -1397,6 +1439,7 @@ impl App {
             }
         }
 
+        // Process latency measurements
         if let Some(rx) = &self.latency_rx {
             while let Ok((addr, ms)) = rx.try_recv() {
                 if let Some(p) = self.peers.iter_mut().find(|p| p.addr == addr) {
@@ -1405,12 +1448,12 @@ impl App {
             }
         }
 
-        // Take the receiver out to process its messages.
-        // This sets `self.relay_rx` to `None` for the duration of this block,
-        // resolving the borrow error when we eventually assign to it or don't put it back.
+        // Process relay messages with non-blocking
         if let Some(rx) = self.relay_rx.take() {
-            let mut keep_channel_active = true;
-            loop {
+            let mut keep = true;
+            let start = std::time::Instant::now();
+
+            while keep && start.elapsed() < std::time::Duration::from_millis(50) {
                 match rx.try_recv() {
                     Ok(RelayMsg::Code(code)) => {
                         self.relay_state = RelayState::Online { code };
@@ -1418,61 +1461,63 @@ impl App {
                     Ok(RelayMsg::Paired { peer }) => {
                         self.relay_state = RelayState::Paired { peer_name: peer };
                     }
-                    Ok(RelayMsg::Ready(_stream_holder)) => {
-                        // Inject the relay stream as a virtual peer
-                        if let RelayState::Paired { ref peer_name } = self.relay_state.clone() {
+                    Ok(RelayMsg::Ready(_)) => {
+                        if let RelayState::Paired { ref peer_name } = self.relay_state {
                             let dummy_ip: std::net::IpAddr = "127.0.0.2".parse().unwrap();
                             let relay_peer = Peer {
-                                name:    peer_name.clone(),
-                                addr:    dummy_ip,
-                                kind:    PeerKind::Remote,
+                                name: peer_name.clone(),
+                                addr: dummy_ip,
+                                kind: PeerKind::Remote,
                                 latency: None,
                             };
                             if !self.peers.iter().any(|p| p.addr == dummy_ip) {
-                                self.peers.push(relay_peer.clone());
+                                self.peers.push(relay_peer);
                             }
-                            let idx = self.peers.iter().position(|p| p.addr == dummy_ip).unwrap();
-                            self.selected = Some(idx);
-                            self.saved_peer_name = peer_name.clone();
-                            self.saved_peer_addr = dummy_ip.to_string();
-                            self.tab = Tab::Send;
+                            if let Some(idx) = self.peers.iter().position(|p| p.addr == dummy_ip) {
+                                self.selected = Some(idx);
+                                self.saved_peer_name = peer_name.clone();
+                                self.saved_peer_addr = dummy_ip.to_string();
+                                self.tab = Tab::Send;
+                            }
                         }
-                        keep_channel_active = false;
-                        break;
+                        keep = false;
                     }
                     Ok(RelayMsg::Error(e)) => {
                         self.relay_state = RelayState::Error(e.clone());
                         self.remote_msg = Some((format!("Connection failed: {}", e), true));
-                        keep_channel_active = false;
-                        break;
+                        keep = false;
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        keep_channel_active = false;
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
-            if keep_channel_active {
+
+            if keep {
                 self.relay_rx = Some(rx);
             }
-            // If not active, self.relay_rx remains None
         }
 
-        // Check for network changes
-        if let Some(new_ip) = self.network_monitor.has_changed() {
-            self.this_ip = new_ip;
-            if self.tab == Tab::Scan && self.scan_mode == ScanMode::Local {
-                self.start_scan();
-            }
-            // Reconnect relay if we were online or in error state
-            if matches!(self.relay_state, RelayState::Online { .. } | RelayState::Error(_)) {
-                self.go_offline();
-                self.go_online();
-            }
+        // Network change detection - safe version without static mut
+        thread_local! {
+            static LAST_NETWORK_CHECK: std::cell::RefCell<std::time::Instant> =
+                std::cell::RefCell::new(std::time::Instant::now());
         }
+
+        LAST_NETWORK_CHECK.with(|last_check| {
+            let mut last = last_check.borrow_mut();
+            if last.elapsed() > std::time::Duration::from_secs(10) {
+                if let Some(new_ip) = self.network_monitor.has_changed() {
+                    self.this_ip = new_ip;
+                    if self.tab == Tab::Scan && self.scan_mode == ScanMode::Local {
+                        self.start_scan();
+                    }
+                    if matches!(self.relay_state, RelayState::Online { .. } | RelayState::Error(_)) {
+                        self.go_offline();
+                        self.go_online();
+                    }
+                }
+                *last = std::time::Instant::now();
+            }
+        });
     }
 
     fn any_active(&self) -> bool {
@@ -1687,6 +1732,18 @@ impl App {
 // ─── eframe::App ─────────────────────────────────────────────────────────────
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Request repaint only when needed - not every frame
+        let needs_repaint = self.scan_state == ScanState::Scanning
+            || self.any_active()
+            || self.sync_active
+            || self.relay_state == RelayState::Connecting;
+
+        if needs_repaint {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+
         let p = self.p();
         ctx.set_visuals({
             let mut v = if self.dark_mode {
@@ -4260,10 +4317,20 @@ fn send_file_resumable(
     name: &str,
     file_size: u64,
     addr: std::net::IpAddr,
-    on_progress: impl Fn(f32),
+    on_progress: impl Fn(f32) + Send + 'static,
 ) -> Result<(), String> {
-    let mut stream =
-        TcpStream::connect((addr, TRANSFER_PORT)).map_err(|e| format!("Cannot connect: {}", e))?;
+    let socket_addr = std::net::SocketAddr::new(addr, TRANSFER_PORT);
+    let mut stream = TcpStream::connect_timeout(
+        &socket_addr,
+        std::time::Duration::from_secs(5),
+    ).map_err(|e| format!("Cannot connect: {}", e))?;
+
+    // Fix: Handle io::Error properly
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
+
     let sender_secret = EphemeralSecret::random_from_rng(AeadOsRng);
     let sender_pub = PublicKey::from(&sender_secret);
     stream
@@ -4278,6 +4345,8 @@ fn send_file_resumable(
     let shared = sender_secret.diffie_hellman(&receiver_pub);
     let aes_key = derive_key(shared.as_bytes());
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
+
+    // Rest of the function remains the same...
     let nb = name.as_bytes();
     let hn = hostname();
     let hb = hn.as_bytes();

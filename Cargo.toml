@@ -1,6 +1,6 @@
 [package]
 name = "rfshare"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 authors     = ["Imrany <imranmat254@gmail.com>"]
 description = "Fast, encrypted file transfers"
@@ -37,12 +37,17 @@ winresource = "0.1"
 opt-level = 3
 lto       = true
 strip     = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
 
 # cargo-bundle metadata
 [package.metadata.bundle]
 name              = "rfshare"
 identifier        = "dev.rfshare.app"
-version           = "0.10.0"
+version           = "0.11.0"
 copyright         = "Copyright © 2026 Imrany"
 category          = "Utility"
 short_description = "Fast, encrypted file transfers"
