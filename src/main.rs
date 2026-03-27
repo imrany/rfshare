@@ -1420,9 +1420,7 @@ impl App {
                     }
                     Ok(RelayMsg::Ready(_stream_holder)) => {
                         // Inject the relay stream as a virtual peer
-                        // The relay stream behaves like a TcpStream for the transfer protocol
                         if let RelayState::Paired { ref peer_name } = self.relay_state.clone() {
-                            // Parse a dummy IP for the relay peer
                             let dummy_ip: std::net::IpAddr = "127.0.0.2".parse().unwrap();
                             let relay_peer = Peer {
                                 name:    peer_name.clone(),
@@ -1430,7 +1428,6 @@ impl App {
                                 kind:    PeerKind::Remote,
                                 latency: None,
                             };
-                            // Add to peers and auto-select
                             if !self.peers.iter().any(|p| p.addr == dummy_ip) {
                                 self.peers.push(relay_peer.clone());
                             }
@@ -1444,37 +1441,34 @@ impl App {
                         break;
                     }
                     Ok(RelayMsg::Error(e)) => {
-                        self.relay_state = RelayState::Error(e);
+                        self.relay_state = RelayState::Error(e.clone());
+                        self.remote_msg = Some((format!("Connection failed: {}", e), true));
                         keep_channel_active = false;
                         break;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        // No messages for now, keep the channel active for next poll
                         break;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        // Channel disconnected, do not keep it active
                         keep_channel_active = false;
                         break;
                     }
                 }
             }
             if keep_channel_active {
-                // Put the receiver back if it's still considered active
                 self.relay_rx = Some(rx);
             }
-            // If not active, self.relay_rx remains None as it was taken initially.
+            // If not active, self.relay_rx remains None
         }
 
         // Check for network changes
         if let Some(new_ip) = self.network_monitor.has_changed() {
             self.this_ip = new_ip;
-            // Re-scan if we're on the scan tab
             if self.tab == Tab::Scan && self.scan_mode == ScanMode::Local {
                 self.start_scan();
             }
-            // Reconnect relay if we were online
-            if let RelayState::Online { .. } = self.relay_state {
+            // Reconnect relay if we were online or in error state
+            if matches!(self.relay_state, RelayState::Online { .. } | RelayState::Error(_)) {
                 self.go_offline();
                 self.go_online();
             }
@@ -1640,18 +1634,22 @@ impl App {
     }
 
     fn go_online(&mut self) {
-        if self.relay_state != RelayState::Offline { return; }
+        // Allow retrying from Error state as well
+        if !matches!(self.relay_state, RelayState::Offline | RelayState::Error(_)) {
+            return;
+        }
+
+        if !self.check_internet_connection() {
+            self.remote_msg = Some(("No internet connection. Please check your network.".into(), true));
+            return;
+        }
+
         self.relay_state = RelayState::Connecting;
         let (tx, rx) = std::sync::mpsc::channel();
         self.relay_rx = Some(rx);
         let tx_clone = tx.clone();
         thread::spawn(move || {
-            // Set timeout for relay connection
-            let tx_clone2 = tx_clone.clone();
-            let result = std::panic::catch_unwind(|| relay_listen(tx_clone));
-            if result.is_err() {
-                let _ = tx_clone2.send(RelayMsg::Error("Connection failed".into()));
-            }
+            relay_listen(tx_clone);
         });
 
         // Set timeout - if no response in 10 seconds, fail
@@ -2348,7 +2346,14 @@ impl App {
                     match self.relay_state.clone() {
                         // ── Offline ───────────────────────────────────────────────────
                         RelayState::Offline | RelayState::Error(_) => {
-                            if let RelayState::Error(ref e) = self.relay_state {
+                            // Extract and clone the error message if present, *before* creating the UI closure
+                            let error_to_display = if let RelayState::Error(ref e) = self.relay_state {
+                                Some(e.clone()) // Clone the error message to own it
+                            } else {
+                                None
+                            };
+
+                            if let Some(e) = error_to_display { // Now 'e' is an owned String, not borrowing from self
                                 egui::Frame::new()
                                     .fill(tint(p.danger, 10))
                                     .stroke(Stroke::new(1.0, tint(p.danger, 40)))
@@ -2359,7 +2364,13 @@ impl App {
                                         ui.horizontal(|ui| {
                                             ui.label(RichText::new(icons::ICON_CLOSE).size(13.0).color(p.danger));
                                             ui.add_space(4.0);
-                                            ui.label(RichText::new(e).size(11.5).color(p.danger));
+                                            ui.label(RichText::new(&e).size(11.5).color(p.danger)); // Use a reference to the owned String
+                                            ui.add_space(8.0);
+                                            if ui.add(pill_btn("Retry", p.accent)).clicked() {
+                                                // Now self.go_online() can borrow self mutably without conflict
+                                                // because 'e' no longer holds an immutable borrow on self.relay_state.
+                                                self.go_online();
+                                            }
                                         });
                                     });
                                 ui.add_space(12.0);
@@ -2471,7 +2482,7 @@ impl App {
                                 });
                             }
 
-                            if let Some((ref msg, is_err)) = self.remote_msg {
+                            if let Some((ref msg, is_err)) = self.remote_msg && !self.is_online {
                                 ui.add_space(8.0);
                                 let col = if is_err { p.danger } else { p.success };
                                 ui.label(RichText::new(msg).size(11.0).color(col));
