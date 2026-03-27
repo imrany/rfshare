@@ -20,7 +20,6 @@ struct Stats {
 type SharedStats = Arc<Mutex<Stats>>;
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
-/// Returns a UTC timestamp string without any external crate dependency.
 fn now_str() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -29,7 +28,6 @@ fn now_str() -> String {
     let s  = secs % 60;
     let m  = (secs / 60) % 60;
     let h  = (secs / 3600) % 24;
-    // Gregorian date from days since Unix epoch (valid through 2099)
     let z  = secs / 86400 + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
@@ -89,7 +87,7 @@ fn pipe(
         });
     }
 
-    // receiver → sender  (also decrements active_pipes when done)
+    // receiver → sender
     {
         let code3  = code.clone();
         let stats3 = Arc::clone(&stats);
@@ -111,6 +109,28 @@ fn pipe(
     }
 }
 
+// ─── Handle HTTP upgrade or plain TCP ────────────────────────────────────────
+fn handle_http_upgrade(mut stream: TcpStream, peer: &str) -> bool {
+    let mut buffer = [0u8; 4];
+    if let Ok(n) = stream.peek(&mut buffer) {
+        if n >= 4 {
+            // Check if it's an HTTP request (starts with GET, POST, etc.)
+            if &buffer[..4] == b"GET " || &buffer[..4] == b"POST" || &buffer[..4] == b"HTTP" {
+                info!("HTTP request detected from {} - sending upgrade response", peer);
+
+                // Send a response that upgrades the connection to WebSocket-like
+                let response = "HTTP/1.1 101 Switching Protocols\r\n\
+                               Upgrade: relay\r\n\
+                               Connection: Upgrade\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ─── Connection handler ───────────────────────────────────────────────────────
 fn handle(mut stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
     let peer = stream.peer_addr()
@@ -121,6 +141,9 @@ fn handle(mut stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
 
     // Prevent stalled clients from leaking threads indefinitely
     stream.set_read_timeout(Some(std::time::Duration::from_secs(130))).ok();
+
+    // Handle HTTP upgrade if needed
+    handle_http_upgrade(stream.try_clone().unwrap(), &peer);
 
     let cloned = match stream.try_clone() {
         Ok(s) => s,
@@ -138,6 +161,34 @@ fn handle(mut stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
 
     let line = line.trim().to_string();
 
+    // Handle HTTP CONNECT method for proxies
+    if line.starts_with("CONNECT") {
+        info!("CONNECT request from {}, sending 200", peer);
+        let _ = writeln!(stream, "HTTP/1.1 200 Connection Established\r\n\r\n");
+        let _ = stream.flush();
+        // After CONNECT, read the next line for the actual command
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) => { warn!("READ_ERR after CONNECT: {}", e); return; }
+        }
+        let line = line.trim().to_string();
+        // Continue with normal handling
+        process_command(stream, peer, line, waiting, stats);
+        return;
+    }
+
+    process_command(stream, peer, line, waiting, stats);
+}
+
+fn process_command(
+    mut stream: TcpStream,
+    peer: String,
+    line: String,
+    waiting: WaitMap,
+    stats: SharedStats,
+) {
     // ── RECEIVER <code> ───────────────────────────────────────────────────
     if let Some(code) = line.strip_prefix("RECEIVER ") {
         let code = code.trim().to_string();
@@ -198,6 +249,13 @@ fn handle(mut stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
         }
 
     // ── Unknown ───────────────────────────────────────────────────────────
+    } else if line.starts_with("HTTP/") {
+        // Handle HTTP request that wasn't upgraded
+        warn!("HTTP_REQUEST_FROM_CLIENT  peer={}  line={:?}", peer, &line[..line.len().min(80)]);
+        let response = "HTTP/1.1 426 Upgrade Required\r\n\
+                       Upgrade: relay\r\n\
+                       Connection: Upgrade\r\n\r\n";
+        let _ = stream.write_all(response.as_bytes());
     } else {
         warn!("UNKNOWN_CMD  peer={}  line={:?}", peer, &line[..line.len().min(80)]);
         let _ = writeln!(stream, "BAD_REQUEST");
@@ -231,7 +289,7 @@ fn main() {
             });
             let expired = before - map.len();
             let waiting_now = map.len();
-            drop(map); // release lock before printing
+            drop(map);
 
             // Print periodic stats
             let st = s.lock().unwrap();
