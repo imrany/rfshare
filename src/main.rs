@@ -890,6 +890,7 @@ pub struct App {
     network_monitor: NetworkMonitor,
     network_monitor_sender: std::sync::mpsc::Sender<String>,
     is_online: bool,
+    last_internet_check: std::time::Instant,
 }
 
 enum RelayMsg {
@@ -974,6 +975,7 @@ impl Default for App {
             network_monitor,
             network_monitor_sender,
             is_online: false,
+            last_internet_check: std::time::Instant::now(),
         }
     }
 }
@@ -2130,8 +2132,11 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        // Update is_online status here
-                        self.is_online = self.check_internet_connection();
+                        // Only check internet connection every 60 seconds instead of every frame
+                        if self.last_internet_check.elapsed() > std::time::Duration::from_secs(60) {
+                            self.is_online = self.check_internet_connection();
+                            self.last_internet_check = std::time::Instant::now();
+                        }
 
                         if self.is_pro() {
                             // ── Local / Remote toggle ─────────────────────────────
@@ -2386,9 +2391,6 @@ impl App {
     // ── Remote panel ──────────────────────────────────────────────────────
     fn show_remote_panel(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let p = self.p();
-
-        // Detect if device is online
-        self.is_online = self.check_internet_connection();
 
         // Use a scroll area with proper centering
         egui::ScrollArea::vertical()
