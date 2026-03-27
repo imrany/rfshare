@@ -109,77 +109,134 @@ fn pipe(
     }
 }
 
-// ─── Handle HTTP upgrade or plain TCP ────────────────────────────────────────
-fn handle_http_upgrade(mut stream: TcpStream, peer: &str) -> bool {
-    let mut buffer = [0u8; 4];
-    if let Ok(n) = stream.peek(&mut buffer) {
-        if n >= 4 {
-            // Check if it's an HTTP request (starts with GET, POST, etc.)
-            if &buffer[..4] == b"GET " || &buffer[..4] == b"POST" || &buffer[..4] == b"HTTP" {
-                info!("HTTP request detected from {} - sending upgrade response", peer);
+// ─── Handle HTTP request ────────────────────────────────────────────────────────
+fn handle_http_request(mut stream: TcpStream, peer: &str) -> Option<String> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut first_line = String::new();
 
-                // Send a response that upgrades the connection to WebSocket-like
-                let response = "HTTP/1.1 101 Switching Protocols\r\n\
-                               Upgrade: relay\r\n\
-                               Connection: Upgrade\r\n\r\n";
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-                return true;
+    match reader.read_line(&mut first_line) {
+        Ok(0) => return None,
+        Ok(_) => {
+            info!("HTTP request from {}: {}", peer, first_line.trim());
+
+            // Parse the path to extract code
+            let parts: Vec<&str> = first_line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let path = parts[1];
+
+                // Handle receiver endpoint
+                if path.starts_with("/receiver/") {
+                    let code = path.strip_prefix("/receiver/").unwrap_or("");
+                    if !code.is_empty() {
+                        info!("Receiver request for code: {}", code);
+                        // Read and discard remaining headers
+                        let mut line = String::new();
+                        while let Ok(len) = reader.read_line(&mut line) {
+                            if len == 0 || line == "\r\n" || line == "\n" {
+                                break;
+                            }
+                            line.clear();
+                        }
+
+                        // Send HTTP response
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: text/plain\r\n\
+                             Connection: keep-alive\r\n\
+                             Content-Length: {}\r\n\
+                             \r\n\
+                             RECEIVER {}\r\n",
+                            format!("RECEIVER {}", code).len(),
+                            code
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        return Some(format!("RECEIVER {}", code));
+                    }
+                }
+                // Handle sender endpoint
+                else if path.starts_with("/sender/") {
+                    let code = path.strip_prefix("/sender/").unwrap_or("");
+                    if !code.is_empty() {
+                        info!("Sender request for code: {}", code);
+                        // Read and discard remaining headers
+                        let mut line = String::new();
+                        while let Ok(len) = reader.read_line(&mut line) {
+                            if len == 0 || line == "\r\n" || line == "\n" {
+                                break;
+                            }
+                            line.clear();
+                        }
+
+                        // Send HTTP response
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: text/plain\r\n\
+                             Connection: keep-alive\r\n\
+                             Content-Length: {}\r\n\
+                             \r\n\
+                             SENDER {}\r\n",
+                            format!("SENDER {}", code).len(),
+                            code
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        return Some(format!("SENDER {}", code));
+                    }
+                }
             }
         }
+        Err(e) => {
+            warn!("Error reading HTTP request: {}", e);
+        }
     }
-    false
+    None
+}
+
+// ─── Handle raw TCP command ────────────────────────────────────────────────────
+fn handle_raw_command(stream: TcpStream, peer: &str) -> Option<String> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(line.trim().to_string()),
+        Err(e) => {
+            warn!("READ_ERR  peer={}  err={}", peer, e);
+            None
+        }
+    }
 }
 
 // ─── Connection handler ───────────────────────────────────────────────────────
-fn handle(mut stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
+fn handle(stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
     let peer = stream.peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
     { stats.lock().unwrap().total_connections += 1; }
 
-    // Prevent stalled clients from leaking threads indefinitely
     stream.set_read_timeout(Some(std::time::Duration::from_secs(130))).ok();
 
-    // Handle HTTP upgrade if needed
-    handle_http_upgrade(stream.try_clone().unwrap(), &peer);
-
-    let cloned = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => { error!("STREAM_CLONE_FAIL  peer={}  err={}", peer, e); return; }
+    // Peek to see if it's HTTP
+    let mut peek_buf = [0u8; 4];
+    let command = match stream.peek(&mut peek_buf) {
+        Ok(n) if n > 0 => {
+            // Check if it's HTTP (starts with G, P, H)
+            if peek_buf[0] == b'G' || peek_buf[0] == b'P' || peek_buf[0] == b'H' {
+                handle_http_request(stream.try_clone().unwrap(), &peer)
+            } else {
+                handle_raw_command(stream.try_clone().unwrap(), &peer)
+            }
+        }
+        _ => None,
     };
 
-    let mut reader = BufReader::new(cloned);
-    let mut line   = String::new();
-
-    match reader.read_line(&mut line) {
-        Ok(0)  => { warn!("EMPTY_READ  peer={}", peer); return; }
-        Ok(_)  => {}
-        Err(e) => { warn!("READ_ERR  peer={}  err={}", peer, e); return; }
-    }
-
-    let mut line = line.trim().to_string();
-
-    // Handle HTTP CONNECT method for proxies
-    if line.starts_with("CONNECT") {
-        info!("CONNECT request from {}, sending 200", peer);
-        let _ = writeln!(stream, "HTTP/1.1 200 Connection Established\r\n\r\n");
-        let _ = stream.flush();
-        // After CONNECT, read the next line for the actual command
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(e) => { warn!("READ_ERR after CONNECT: {}", e); return; }
+    match command {
+        Some(cmd) => process_command(stream, peer, cmd, waiting, stats),
+        None => {
+            warn!("No valid command from {}", peer);
         }
-        let line = line.trim().to_string();
-        // Continue with normal handling
-        process_command(stream, peer, line, waiting, stats);
-        return;
     }
-
-    process_command(stream, peer, line, waiting, stats);
 }
 
 fn process_command(
@@ -249,13 +306,6 @@ fn process_command(
         }
 
     // ── Unknown ───────────────────────────────────────────────────────────
-    } else if line.starts_with("HTTP/") {
-        // Handle HTTP request that wasn't upgraded
-        warn!("HTTP_REQUEST_FROM_CLIENT  peer={}  line={:?}", peer, &line[..line.len().min(80)]);
-        let response = "HTTP/1.1 426 Upgrade Required\r\n\
-                       Upgrade: relay\r\n\
-                       Connection: Upgrade\r\n\r\n";
-        let _ = stream.write_all(response.as_bytes());
     } else {
         warn!("UNKNOWN_CMD  peer={}  line={:?}", peer, &line[..line.len().min(80)]);
         let _ = writeln!(stream, "BAD_REQUEST");
