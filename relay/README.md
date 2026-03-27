@@ -53,3 +53,20 @@ docker run -d --restart unless-stopped -p 443:9000 --name rfshare-relay ghcr.io/
 ```
 
 **Changed constant:** `RELAY_HOST` and `RELAY_PORT` — update these to match your deployed relay server before shipping
+
+## Test with curl
+Replace `example.com` with real domain name.
+
+```bash
+# Test receiver endpoint
+curl -v https://relay.example.com/receiver/TEST123
+
+# Should return:
+# RECEIVER TEST123
+
+# Test sender endpoint  
+curl -v https://relay.example.com/sender/TEST123
+
+# Should return:
+# SENDER TEST123
+```
