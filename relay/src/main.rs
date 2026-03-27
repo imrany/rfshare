@@ -159,7 +159,7 @@ fn handle(mut stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
         Err(e) => { warn!("READ_ERR  peer={}  err={}", peer, e); return; }
     }
 
-    let line = line.trim().to_string();
+    let mut line = line.trim().to_string();
 
     // Handle HTTP CONNECT method for proxies
     if line.starts_with("CONNECT") {

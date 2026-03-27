@@ -8,7 +8,7 @@ WORKDIR /build
 # ── Dependency-cache layer ────────────────────────────────────────────────────
 # Copy all manifests first so Docker can cache the dep-download layer
 # independently of source changes.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml  ./
 COPY relay/Cargo.toml ./relay/Cargo.toml
 
 # Stub the crate source so `cargo build` resolves and compiles all deps
