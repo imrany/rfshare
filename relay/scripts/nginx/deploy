@@ -24,3 +24,20 @@ server {
         proxy_connect_timeout 75s;
     }
 }
+
+# http to https redirect
+server {
+    if ($host = www.relay.example.com) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    if ($host = relay.example.com) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    server_name relay.example.com www.relay.example.com;
+    listen 80;
+    return 404; # managed by Certbot
+}
