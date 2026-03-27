@@ -35,6 +35,41 @@ const SYNC_POLL_MS: u64 = 2_000; // how often the sync watcher polls each folder
 const RELAY_HOST: &str = "relay.triple-ts-mediclinic.com";
 const RELAY_PORT: u16  = 443;
 
+//  network monitoring
+struct NetworkMonitor {
+    current_ip: Arc<Mutex<String>>,
+    rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl NetworkMonitor {
+    fn new() -> (Self, std::sync::mpsc::Sender<String>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let current_ip = Arc::new(Mutex::new(local_ip()));
+
+        // Start network monitoring thread
+        let current_ip_clone = current_ip.clone();
+        let tx_clone = tx.clone();
+        std::thread::spawn(move || {
+            let mut last_ip = current_ip_clone.lock().unwrap().clone();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let new_ip = local_ip();
+                if new_ip != last_ip {
+                    last_ip = new_ip.clone();
+                    *current_ip_clone.lock().unwrap() = new_ip;
+                    let _ = tx_clone.send(last_ip.clone());
+                }
+            }
+        });
+
+        (Self { current_ip, rx }, tx)
+    }
+
+    fn has_changed(&mut self) -> Option<String> {
+        self.rx.try_recv().ok()
+    }
+}
+
 /// Generate a random 8-char session code like "A3F7-K2M9"
 fn gen_session_code() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -824,6 +859,10 @@ pub struct App {
     relay_state: RelayState,
     relay_rx:   Option<std::sync::mpsc::Receiver<RelayMsg>>,
     relay_code_input: String,   // sender: code entry field
+
+    network_monitor: NetworkMonitor,
+    network_monitor_sender: std::sync::mpsc::Sender<String>,
+    is_online: bool,
 }
 
 enum RelayMsg {
@@ -836,6 +875,7 @@ enum RelayMsg {
 impl Default for App {
     fn default() -> Self {
         let prefs = load_prefs();
+        let (network_monitor, network_monitor_sender) = NetworkMonitor::new();
         let recv_state = Arc::new(Mutex::new(RecvState::default()));
         let save_dir = prefs.save_dir.clone().unwrap_or_else(|| {
             dirs::download_dir()
@@ -904,6 +944,9 @@ impl Default for App {
             relay_state:      RelayState::Offline,
             relay_rx:         None,
             relay_code_input: String::new(),
+            network_monitor,
+            network_monitor_sender,
+            is_online: false,
         }
     }
 }
@@ -919,6 +962,14 @@ impl App {
 
     fn is_pro(&self) -> bool {
         self.license.is_pro()
+    }
+
+    fn check_internet_connection(&self) -> bool {
+        // Try to connect to a reliable host
+        std::net::TcpStream::connect_timeout(
+            &("8.8.8.8:53").parse().unwrap(),
+            std::time::Duration::from_secs(3),
+        ).is_ok()
     }
 
     fn _try_auto_select(&mut self) {
@@ -1414,6 +1465,20 @@ impl App {
             }
             // If not active, self.relay_rx remains None as it was taken initially.
         }
+
+        // Check for network changes
+        if let Some(new_ip) = self.network_monitor.has_changed() {
+            self.this_ip = new_ip;
+            // Re-scan if we're on the scan tab
+            if self.tab == Tab::Scan && self.scan_mode == ScanMode::Local {
+                self.start_scan();
+            }
+            // Reconnect relay if we were online
+            if let RelayState::Online { .. } = self.relay_state {
+                self.go_offline();
+                self.go_online();
+            }
+        }
     }
 
     fn any_active(&self) -> bool {
@@ -1579,24 +1644,45 @@ impl App {
         self.relay_state = RelayState::Connecting;
         let (tx, rx) = std::sync::mpsc::channel();
         self.relay_rx = Some(rx);
-        thread::spawn(move || relay_listen(tx));
+        let tx_clone = tx.clone();
+        thread::spawn(move || {
+            // Set timeout for relay connection
+            let tx_clone2 = tx_clone.clone();
+            let result = std::panic::catch_unwind(|| relay_listen(tx_clone));
+            if result.is_err() {
+                let _ = tx_clone2.send(RelayMsg::Error("Connection failed".into()));
+            }
+        });
+
+        // Set timeout - if no response in 10 seconds, fail
+        let tx_timeout = tx.clone();
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_secs(10));
+            let _ = tx_timeout.send(RelayMsg::Error("Connection timeout".into()));
+        });
     }
 
     fn go_offline(&mut self) {
         self.relay_state = RelayState::Offline;
         self.relay_rx = None;
+        self.remote_msg = None;
     }
 
     fn connect_via_relay(&mut self) {
         let code = self.relay_code_input.trim().to_uppercase().replace(' ', "");
-        if code.len() < 8 {
-            self.remote_msg = Some(("Enter the 8-character code".into(), true));
+        if code.len() != 9 {
+            self.remote_msg = Some(("Enter the 9-character code".into(), true));
+            return;
+        }
+        if !self.check_internet_connection() {
+            self.remote_msg = Some(("No internet connection. Please check your network.".into(), true));
             return;
         }
         self.relay_state = RelayState::Connecting;
         let (tx, rx) = std::sync::mpsc::channel();
         self.relay_rx = Some(rx);
-        thread::spawn(move || relay_connect(&code, tx));
+        let code_clone = code.clone();
+        thread::spawn(move || relay_connect(&code_clone, tx));
     }
 }
 
@@ -1985,12 +2071,13 @@ impl App {
         // ── Toolbar ───────────────────────────────────────────────────────
         if !scanning {
             egui::Frame::new()
-                // .fill(p.surface)
-                // .stroke(Stroke::new(1.0, p.border))
                 .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
+                        // Update is_online status here
+                        self.is_online = self.check_internet_connection();
+
                         if self.is_pro() {
                             // ── Local / Remote toggle ─────────────────────────────
                             for (label, mode) in [
@@ -2015,57 +2102,59 @@ impl App {
                             ui.add_space(8.0);
                         }
 
-                        let n = self.peers.iter().filter(|p| p.kind == PeerKind::Local).count();
-                        // Local mode: filter
-                        if self.scan_mode == ScanMode::Local && n > 0 {
-                            let scan_lbl = format!("{}  Rescan", icons::ICON_SEARCH);
-                            ui.add_enabled_ui(!scanning, |ui| {
-                                if ui.add(egui::Button::new(
-                                    RichText::new(&scan_lbl).size(12.0).color(Color32::WHITE))
-                                    .fill(p.surface2).corner_radius(6.0)
-                                    .stroke(Stroke::new(1.0, p.border))
-                                    .min_size(Vec2::new(80.0, 30.0))).clicked()
-                                {
-                                    self.start_scan();
-                                }
-                            });
-                            ui.add_space(8.0);
-
-                            egui::Frame::new()
-                                .fill(p.bg)
-                                .stroke(Stroke::new(1.0,
-                                    if !self.scan_filter.is_empty() { p.accent } else { p.border }))
-                                .corner_radius(6.0)
-                                .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 5 })
-                                .show(ui, |ui| {
-                                    ui.set_min_width(160.0);
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new(icons::ICON_SEARCH)
-                                            .size(13.0).color(p.text_faint));
-                                        ui.add_space(4.0);
-                                        ui.add(egui::TextEdit::singleline(&mut self.scan_filter)
-                                            .hint_text("Filter…")
-                                            .desired_width(110.0)
-                                            .frame(false));
-                                        if !self.scan_filter.is_empty() {
-                                            if ui.add(egui::Button::new(
-                                                RichText::new(icons::ICON_CLOSE).size(11.0)
-                                                .color(p.text_faint)).frame(false)).clicked()
-                                            {
-                                                self.scan_filter.clear();
-                                            }
-                                        }
-                                    });
+                        // Only show local scan controls when in Local mode
+                        if self.scan_mode == ScanMode::Local {
+                            let n = self.peers.iter().filter(|p| p.kind == PeerKind::Local).count();
+                            if n > 0 {
+                                let scan_lbl = format!("{}  Rescan", icons::ICON_SEARCH);
+                                ui.add_enabled_ui(!scanning, |ui| {
+                                    if ui.add(egui::Button::new(
+                                        RichText::new(&scan_lbl).size(12.0).color(Color32::WHITE))
+                                        .fill(p.surface2).corner_radius(6.0)
+                                        .stroke(Stroke::new(1.0, p.border))
+                                        .min_size(Vec2::new(80.0, 30.0))).clicked()
+                                    {
+                                        self.start_scan();
+                                    }
                                 });
-                            if self.scan_state == ScanState::Done {
                                 ui.add_space(8.0);
-                                ui.label(RichText::new(format!(
-                                    "{} device{}", n, if n == 1 {""} else {"s"}))
-                                    .size(11.0).color(p.text_faint));
+
+                                egui::Frame::new()
+                                    .fill(p.bg)
+                                    .stroke(Stroke::new(1.0,
+                                        if !self.scan_filter.is_empty() { p.accent } else { p.border }))
+                                    .corner_radius(6.0)
+                                    .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 5 })
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(160.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(icons::ICON_SEARCH)
+                                                .size(13.0).color(p.text_faint));
+                                            ui.add_space(4.0);
+                                            ui.add(egui::TextEdit::singleline(&mut self.scan_filter)
+                                                .hint_text("Filter…")
+                                                .desired_width(110.0)
+                                                .frame(false));
+                                            if !self.scan_filter.is_empty() {
+                                                if ui.add(egui::Button::new(
+                                                    RichText::new(icons::ICON_CLOSE).size(11.0)
+                                                    .color(p.text_faint)).frame(false)).clicked()
+                                                {
+                                                    self.scan_filter.clear();
+                                                }
+                                            }
+                                        });
+                                    });
+                                if self.scan_state == ScanState::Done {
+                                    ui.add_space(8.0);
+                                    ui.label(RichText::new(format!(
+                                        "{} device{}", n, if n == 1 {""} else {"s"}))
+                                        .size(11.0).color(p.text_faint));
+                                }
                             }
                         }
 
-                        // Remote mode: online status indicator
+                        // Remote mode controls
                         if self.scan_mode == ScanMode::Remote {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 match &self.relay_state {
@@ -2116,7 +2205,6 @@ impl App {
                         });
                     });
                 });
-
         }
 
         // ── Content ───────────────────────────────────────────────────────
@@ -2244,231 +2332,260 @@ impl App {
     fn show_remote_panel(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let p = self.p();
 
-        ui.add_space(12.0);
+        // Detect if device is online
+        self.is_online = self.check_internet_connection();
 
-        match self.relay_state.clone() {
+        // Use a scroll area with proper centering
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(12.0);
 
-            // ── Offline ───────────────────────────────────────────────────
-            RelayState::Offline | RelayState::Error(_) => {
-                if let RelayState::Error(ref e) = self.relay_state {
-                    egui::Frame::new()
-                        .fill(tint(p.danger, 10))
-                        .stroke(Stroke::new(1.0, tint(p.danger, 40)))
-                        .corner_radius(8.0)
-                        .inner_margin(egui::Margin::same(10))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(icons::ICON_CLOSE).size(13.0).color(p.danger));
-                                ui.add_space(6.0);
-                                ui.label(RichText::new(e).size(11.5).color(p.danger));
-                            });
-                        });
-                    ui.add_space(12.0);
-                }
+                // Center the content horizontally
+                ui.vertical_centered(|ui| {
+                    ui.set_width(ui.available_width());
 
-                ui.vertical_centered(|ui| { // Vertically center the main content block
-                    // How it works info box
-                    card(ui, &p, |ui| {
-                        ui.vertical(|ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.label(RichText::new("Share files over the internet")
-                                .size(13.0).strong().color(p.text));
-                            ui.add_space(8.0);
-                            for (icon, text) in [
-                                ("📱", "Receiver clicks  Go Online  → gets a code"),
-                                ("💬", "Receiver shares the code with the sender"),
-                                ("🔗", "Sender enters the code and connects"),
-                                ("🔒", "Files transfer end-to-end encrypted via relay"),
-                            ] {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(icon).size(14.0));
-                                    ui.add_space(8.0);
-                                    ui.label(RichText::new(text).size(12.0).color(p.text_dim));
-                                });
-                                ui.add_space(4.0);
-                            }
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(
-                                "No port forwarding needed. The relay only sees encrypted data.")
-                                .size(10.5).color(p.text_faint));
-                        });
-                    });
-
-                   ui.add_space(16.0);
-
-                    // Two action cards side by side
-                    let avail = ui.available_width();
-                    let card_w = (avail - 12.0) / 2.0;
-                    ui.vertical(|ui| {
-                        // Receive card
-                        egui::Frame::new()
-                            .fill(p.surface)
-                            .stroke(Stroke::new(1.0, p.border))
-                            .corner_radius(10.0)
-                            .inner_margin(egui::Margin::same(14))
-                            .show(ui, |ui| {
-                                ui.set_min_width(card_w);
-                                ui.set_max_width(card_w);
-                                ui.vertical_centered(|ui| {
-                                    ui.label(RichText::new("📥").size(28.0));
-                                    ui.add_space(6.0);
-                                    ui.label(RichText::new("Receive files")
-                                        .size(13.0).strong().color(p.text));
-                                    ui.add_space(4.0);
-                                    ui.label(RichText::new("Go online to get a share code")
-                                        .size(11.0).color(p.text_dim));
-                                    ui.add_space(10.0);
-                                    if ui.add(egui::Button::new(
-                                        RichText::new("  Go Online  ").size(12.5)
-                                        .color(Color32::WHITE))
-                                        .fill(p.success).corner_radius(8.0)
-                                        .min_size(Vec2::new(ui.available_width(), 36.0))).clicked()
-                                    {
-                                        self.go_online();
-                                    }
-                                });
-                            });
-
-                        ui.add_space(12.0);
-
-                        // Send card
-                        egui::Frame::new()
-                            .fill(p.surface)
-                            .stroke(Stroke::new(1.0, p.border))
-                            .corner_radius(10.0)
-                            .inner_margin(egui::Margin::same(14))
-                            .show(ui, |ui| {
-                                ui.set_min_width(card_w);
-                                ui.set_max_width(card_w);
-                                ui.vertical_centered(|ui| {
-                                    ui.label(RichText::new("📤").size(28.0));
-                                    ui.add_space(6.0);
-                                    ui.label(RichText::new("Send files")
-                                        .size(13.0).strong().color(p.text));
-                                    ui.add_space(4.0);
-                                    ui.label(RichText::new("Enter the code from the receiver")
-                                        .size(11.0).color(p.text_dim));
-                                    ui.add_space(10.0);
-                                    egui::Frame::new()
-                                        .fill(p.bg)
-                                        .stroke(Stroke::new(1.0, p.border))
-                                        .corner_radius(6.0)
-                                        .inner_margin(egui::Margin { left:8, right:8, top:6, bottom:6 })
-                                        .show(ui, |ui| {
-                                            ui.add(egui::TextEdit::singleline(
-                                                &mut self.relay_code_input)
-                                                .hint_text("XXXX-XXXX")
-                                                .desired_width(f32::INFINITY)
-                                                .frame(false));
+                    match self.relay_state.clone() {
+                        // ── Offline ───────────────────────────────────────────────────
+                        RelayState::Offline | RelayState::Error(_) => {
+                            if let RelayState::Error(ref e) = self.relay_state {
+                                egui::Frame::new()
+                                    .fill(tint(p.danger, 10))
+                                    .stroke(Stroke::new(1.0, tint(p.danger, 40)))
+                                    .corner_radius(8.0)
+                                    .inner_margin(egui::Margin::same(10))
+                                    .show(ui, |ui| {
+                                        ui.set_width((ui.available_width() - 40.0).min(500.0));
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(icons::ICON_CLOSE).size(13.0).color(p.danger));
+                                            ui.add_space(4.0);
+                                            ui.label(RichText::new(e).size(11.5).color(p.danger));
                                         });
-                                    ui.add_space(6.0);
-                                    let can = self.relay_code_input.trim().len() >= 8;
-                                    ui.add_enabled_ui(can, |ui| {
-                                        if ui.add(egui::Button::new(
-                                            RichText::new("  Connect  ").size(12.5)
-                                            .color(Color32::WHITE))
-                                            .fill(if can { p.accent } else { p.text_faint })
-                                            .corner_radius(8.0)
-                                            .min_size(Vec2::new(ui.available_width(), 36.0))).clicked()
-                                            || (ui.input(|i| i.key_pressed(egui::Key::Enter)) && can)
-                                        {
-                                            self.connect_via_relay();
-                                        }
+                                    });
+                                ui.add_space(12.0);
+                            }
+
+                            // Only show "Go Online" button if device is online
+                            if self.is_online {
+                                // Main content card - centered with fixed width
+                                let avail = ui.available_width();
+                                let card_width = (avail  - 40.0).min(500.0);
+                                ui.vertical(|ui| {
+                                    ui.set_width(avail);
+                                    ui.vertical_centered(|ui| {
+                                        // Receive card
+                                        egui::Frame::new()
+                                            .fill(p.surface)
+                                            .stroke(Stroke::new(1.0, p.border))
+                                            .corner_radius(10.0)
+                                            .inner_margin(egui::Margin::same(14))
+                                            .show(ui, |ui| {
+                                                ui.set_width(card_width);
+                                                ui.vertical_centered(|ui| {
+                                                    ui.label(RichText::new("📥").size(28.0));
+                                                    ui.add_space(6.0);
+                                                    ui.label(RichText::new("Receive files")
+                                                        .size(13.0).strong().color(p.text));
+                                                    ui.add_space(4.0);
+                                                    ui.label(RichText::new("Go online to get a share code")
+                                                        .size(11.0).color(p.text_dim));
+                                                    ui.add_space(10.0);
+                                                    if ui.add(egui::Button::new(
+                                                        RichText::new("  Go Online  ").size(12.5)
+                                                        .color(Color32::WHITE))
+                                                        .fill(p.success).corner_radius(8.0)
+                                                        .min_size(Vec2::new(ui.available_width(), 36.0))).clicked()
+                                                    {
+                                                        self.go_online();
+                                                    }
+                                                });
+                                            });
+
+                                        ui.add_space(12.0);
+
+                                        // Send card
+                                        egui::Frame::new()
+                                            .fill(p.surface)
+                                            .stroke(Stroke::new(1.0, p.border))
+                                            .corner_radius(10.0)
+                                            .inner_margin(egui::Margin::same(14))
+                                            .show(ui, |ui| {
+                                                ui.set_width(card_width);
+                                                ui.vertical_centered(|ui| {
+                                                    ui.label(RichText::new("📤").size(28.0));
+                                                    ui.add_space(6.0);
+                                                    ui.label(RichText::new("Send files")
+                                                        .size(13.0).strong().color(p.text));
+                                                    ui.add_space(4.0);
+                                                    ui.label(RichText::new("Enter the code from the receiver")
+                                                        .size(11.0).color(p.text_dim));
+                                                    ui.add_space(10.0);
+                                                    egui::Frame::new()
+                                                        .fill(p.bg)
+                                                        .stroke(Stroke::new(1.0, p.border))
+                                                        .corner_radius(6.0)
+                                                        .inner_margin(egui::Margin { left:8, right:8, top:6, bottom:6 })
+                                                        .show(ui, |ui| {
+                                                            ui.set_width(ui.available_width());
+                                                            ui.add(egui::TextEdit::singleline(
+                                                                &mut self.relay_code_input)
+                                                                .hint_text("XXXX-XXXX")
+                                                                .desired_width(f32::INFINITY)
+                                                                .frame(false));
+                                                        });
+                                                    ui.add_space(6.0);
+                                                    let can = self.relay_code_input.trim().len() == 9;
+                                                    ui.add_enabled_ui(can, |ui| {
+                                                        if ui.add(egui::Button::new(
+                                                            RichText::new("  Connect  ").size(12.5)
+                                                            .color(Color32::WHITE))
+                                                            .fill(if can { p.accent } else { p.text_faint })
+                                                            .corner_radius(8.0)
+                                                            .min_size(Vec2::new(ui.available_width(), 36.0))).clicked()
+                                                            || (ui.input(|i| i.key_pressed(egui::Key::Enter)) && can)
+                                                        {
+                                                            self.connect_via_relay();
+                                                        }
+                                                    });
+                                                });
+                                            });
+
                                     });
                                 });
+                            } else {
+                                // Device is offline - show offline message
+                                ui.add_space(60.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(RichText::new("📡").size(40.0));
+                                    ui.add_space(12.0);
+                                    ui.label(RichText::new("No Internet Connection")
+                                        .size(16.0).strong().color(p.text));
+                                    ui.add_space(8.0);
+                                    ui.label(RichText::new(
+                                        "Please check your network connection and try again.")
+                                        .size(12.0).color(p.text_dim));
+                                    ui.add_space(16.0);
+                                    if ui.add(pill_btn("Check Again", p.accent)).clicked() {
+                                        self.is_online = self.check_internet_connection();
+                                    }
+                                });
+                            }
+
+                            if let Some((ref msg, is_err)) = self.remote_msg {
+                                ui.add_space(8.0);
+                                let col = if is_err { p.danger } else { p.success };
+                                ui.label(RichText::new(msg).size(11.0).color(col));
+                            }
+
+                            // Instructions at the bottom
+                            ui.add_space(32.0);
+                            egui::Frame::new()
+                                .fill(tint(p.surface2, 50))
+                                .stroke(Stroke::new(1.0, p.border))
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.set_width((ui.available_width() - 40.0).min(500.0));
+                                    ui.vertical(|ui| {
+                                        ui.label(RichText::new(format!("{}  How to use remote sharing:", icons::ICON_INFO))
+                                            .size(11.0).strong().color(p.text_dim));
+                                        ui.add_space(4.0);
+                                        ui.label(RichText::new("1. Receiver clicks 'Go Online' to get a share code")
+                                            .size(10.0).color(p.text_faint));
+                                        ui.label(RichText::new("2. Receiver shares the code with the sender")
+                                            .size(10.0).color(p.text_faint));
+                                        ui.label(RichText::new("3. Sender enters the code and connects")
+                                            .size(10.0).color(p.text_faint));
+                                        ui.label(RichText::new("4. Files transfer securely via relay")
+                                            .size(10.0).color(p.text_faint));
+                                    });
+                                });
+                            ui.add_space(60.0);
+                        }
+
+                        // ── Connecting ────────────────────────────────────────────────
+                        RelayState::Connecting => {
+                            ui.add_space(60.0);
+                            ui.vertical_centered(|ui| {
+                                ui.spinner();
+                                ui.add_space(12.0);
+                                ui.label(RichText::new("Connecting to relay…")
+                                    .size(13.0).color(p.text_dim));
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("This only takes a moment")
+                                    .size(11.0).color(p.text_faint));
+                                ui.add_space(16.0);
+                                if ui.add(pill_btn("Cancel", p.danger)).clicked() {
+                                    self.go_offline();
+                                }
                             });
-                    });
+                        }
 
-                    if let Some((ref msg, is_err)) = self.remote_msg {
-                        ui.add_space(8.0);
-                        let col = if is_err { p.danger } else { p.success };
-                        ui.label(RichText::new(msg).size(11.0).color(col));
+                        // ── Online: receiver waiting with code ────────────────────────
+                        RelayState::Online { ref code } => {
+                            let code = code.clone();
+                            ui.add_space(8.0);
+                            ui.vertical_centered(|ui| {
+                                // Status dot
+                                ui.horizontal(|ui| {
+                                    let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
+                                    ui.painter().circle_filled(r.center(), 5.0, p.success);
+                                    ui.add_space(6.0);
+                                    ui.label(RichText::new("You're online — waiting for sender…")
+                                        .size(12.0).color(p.success));
+                                });
+                                ui.add_space(20.0);
+
+                                // Big code display
+                                ui.label(RichText::new("Your share code").size(12.0).color(p.text_dim));
+                                ui.add_space(8.0);
+                                egui::Frame::new()
+                                    .fill(tint(p.accent, 18))
+                                    .stroke(Stroke::new(2.0, tint(p.accent, 60)))
+                                    .corner_radius(12.0)
+                                    .inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 16 })
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(&code)
+                                            .size(32.0).strong()
+                                            .color(p.accent)
+                                            .monospace());
+                                    });
+
+                                ui.add_space(12.0);
+                                if ui.add(pill_btn("Copy code", p.accent)).clicked() {
+                                    ui.ctx().copy_text(code.clone());
+                                }
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("Share this code with the sender.")
+                                    .size(11.0).color(p.text_dim));
+                                ui.label(RichText::new("Code expires when used or after 5 minutes.")
+                                    .size(10.5).color(p.text_faint));
+                                ui.add_space(16.0);
+                                if ui.add(pill_btn("Cancel", p.danger)).clicked() {
+                                    self.go_offline();
+                                }
+                            });
+                        }
+
+                        // ── Paired ────────────────────────────────────────────────────
+                        RelayState::Paired { ref peer_name } => {
+                            let peer_name = peer_name.clone();
+                            ui.add_space(60.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new(icons::ICON_CHECK).size(36.0).color(p.success));
+                                ui.add_space(8.0);
+                                ui.label(RichText::new(format!("Connected to {}", peer_name))
+                                    .size(14.0).strong().color(p.text));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Switching to Send tab…")
+                                    .size(11.0).color(p.text_dim));
+                            });
+                        }
                     }
                 });
-            }
-
-            // ── Connecting ────────────────────────────────────────────────
-            RelayState::Connecting => {
-                ui.add_space(60.0);
-                ui.vertical_centered(|ui| {
-                    ui.spinner();
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("Connecting to relay…")
-                        .size(13.0).color(p.text_dim));
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("This only takes a moment")
-                        .size(11.0).color(p.text_faint));
-                    ui.add_space(16.0);
-                    if ui.add(pill_btn("Cancel", p.danger)).clicked() {
-                        self.go_offline();
-                    }
-                });
-            }
-
-            // ── Online: receiver waiting with code ────────────────────────
-            RelayState::Online { ref code } => {
-                let code = code.clone();
-                ui.add_space(8.0);
-                ui.vertical_centered(|ui| {
-                    // Status dot
-                    ui.horizontal(|ui| {
-                        let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
-                        ui.painter().circle_filled(r.center(), 5.0, p.success);
-                        ui.add_space(6.0);
-                        ui.label(RichText::new("You're online — waiting for sender…")
-                            .size(12.0).color(p.success));
-                    });
-                    ui.add_space(20.0);
-
-                    // Big code display
-                    ui.label(RichText::new("Your share code").size(12.0).color(p.text_dim));
-                    ui.add_space(8.0);
-                    egui::Frame::new()
-                        .fill(tint(p.accent, 18))
-                        .stroke(Stroke::new(2.0, tint(p.accent, 60)))
-                        .corner_radius(12.0)
-                        .inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 16 })
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(&code)
-                                .size(32.0).strong()
-                                .color(p.accent)
-                                .monospace());
-                        });
-
-                    ui.add_space(12.0);
-                    if ui.add(pill_btn("Copy code", p.accent)).clicked() {
-                        ui.ctx().copy_text(code.clone());
-                    }
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Share this code with the sender.")
-                        .size(11.0).color(p.text_dim));
-                    ui.label(RichText::new("Code expires when used or after 5 minutes.")
-                        .size(10.5).color(p.text_faint));
-                    ui.add_space(16.0);
-                    if ui.add(pill_btn("Cancel", p.danger)).clicked() {
-                        self.go_offline();
-                    }
-                });
-            }
-
-            // ── Paired ────────────────────────────────────────────────────
-            RelayState::Paired { ref peer_name } => {
-                let peer_name = peer_name.clone();
-                ui.add_space(60.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("✓").size(36.0).color(p.success));
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(format!("Connected to {}", peer_name))
-                        .size(14.0).strong().color(p.text));
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Switching to Send tab…")
-                        .size(11.0).color(p.text_dim));
-                });
-            }
-        }
-
-        ui.add_space(16.0);
+            });
     }
+
 
     fn show_send(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, wide: bool) {
         let avail = ui.available_size();
@@ -4414,26 +4531,89 @@ fn notify(title: &str, body: &str) -> Result<(), ()> {
             .arg(&sc)
             .spawn();
     }
+    // Windows 10/11 toast notifications (the modern ones that appear in the action center)
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CNW: u32 = 0x08000000;
-        // Use a known system AppID
-        let app_id = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
 
-        let sc = format!(
-            "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]>$null;\
-             $t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);\
-             $t.SelectSingleNode('//text[@id=1]').InnerText='{}';\
-             $t.SelectSingleNode('//text[@id=2]').InnerText='{}';\
-             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{}').Show([Windows.UI.Notifications.ToastNotification]::new($t))",
-            title, body, app_id
+        // Create a temp PowerShell script file for better reliability
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join(format!("toast_{}.ps1", std::process::id()));
+
+        // Escape strings for PowerShell
+        let title_escaped = title.replace("'", "''");
+        let body_escaped = body.replace("'", "''");
+
+        // Get the executable path for icon
+        let exe_path = std::env::current_exe().unwrap_or_default();
+        let exe_path_str = exe_path.to_string_lossy().replace('\\', "\\\\");
+
+        // Create PowerShell script content
+        let script_content = format!(
+            "$title = '{}'
+            $body = '{}'
+            $exePath = '{}'
+
+            # Try to load Windows.UI.Notifications
+            try {{
+                [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+
+                # Create a template
+                $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+
+                # Set text
+                $textNodes = $template.GetElementsByTagName('text')
+                $textNodes[0].AppendChild($template.CreateTextNode($title)) | Out-Null
+                $textNodes[1].AppendChild($template.CreateTextNode($body)) | Out-Null
+
+                # Set app ID
+                $appId = '{}.{}'
+                $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
+                $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
+                $toast.Tag = 'FileTransfer'
+                $toast.Group = 'Transfers'
+                $toast.ExpirationTime = [DateTimeOffset]::Now.AddSeconds(30)
+
+                # Show notification
+                $notifier.Show($toast)
+            }}
+            catch {{
+                # Fallback to balloon tip
+                Add-Type -AssemblyName System.Windows.Forms
+                $notification = New-Object System.Windows.Forms.NotifyIcon
+                if (Test-Path $exePath) {{
+                    $notification.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
+                }}
+                $notification.BalloonTipTitle = $title
+                $notification.BalloonTipText = $body
+                $notification.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+                $notification.Visible = $true
+                $notification.ShowBalloonTip(3000)
+                Start-Sleep -Seconds 3
+                $notification.Dispose()
+            }}",
+            title_escaped, body_escaped, exe_path_str, env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")
         );
 
+        // Write script to temp file
+        let _ = std::fs::write(&script_path, script_content);
+
+        // Execute the script
         let _ = std::process::Command::new("powershell")
-            .args(["-WindowStyle", "Hidden", "-Command", &sc])
+            .args([
+                "-WindowStyle", "Hidden",
+                "-ExecutionPolicy", "Bypass",
+                "-File", script_path.to_str().unwrap()
+            ])
             .creation_flags(CNW)
             .spawn();
+
+        // Clean up script after a delay
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = std::fs::remove_file(script_path);
+        });
     }
 
     Ok(())
