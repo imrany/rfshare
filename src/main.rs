@@ -342,12 +342,89 @@ fn toggle_switch(ui: &mut egui::Ui, p: &Pal, on: bool) -> egui::Response {
 }
 
 fn fetch_latest_version() -> Option<String> {
-    let mut stream = std::net::TcpStream::connect(("github.com", 80)).ok()?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
-    write!(stream,
-        "GET /imrany/{}/releases/latest HTTP/1.1\r\nHost: github.com\r\nUser-Agent: {}\r\nConnection: close\r\n\r\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_NAME")
-    ).ok()?;
-    for line in BufReader::new(stream).lines().take(20).flatten() {
+    // Try GitHub API first (more reliable)
+    let api_url = format!("https://api.github.com/repos/imrany/{}/releases/latest", env!("CARGO_PKG_NAME"));
+
+    let mut stream = match std::net::TcpStream::connect(("api.github.com", 443)) {
+        Ok(s) => s,
+        Err(_) => {
+            // Fallback to alternative method
+            return fetch_version_alternative();
+        }
+    };
+
+    // Use HTTPS
+    use std::io::Write;
+    let request = format!(
+        "GET /repos/imrany/{}/releases/latest HTTP/1.1\r\n\
+         Host: api.github.com\r\n\
+         User-Agent: {}\r\n\
+         Accept: application/vnd.github.v3+json\r\n\
+         Connection: close\r\n\
+         \r\n",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_NAME")
+    );
+
+    if stream.write_all(request.as_bytes()).is_err() {
+        return fetch_version_alternative();
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+
+    // Read headers
+    while let Ok(line) = reader.read_line(&mut response) {
+        if line == 0 || response.ends_with("\r\n\r\n") || response.ends_with("\n\n") {
+            break;
+        }
+    }
+
+    // Read body
+    let mut body = String::new();
+    if reader.read_to_string(&mut body).is_err() {
+        return fetch_version_alternative();
+    }
+
+    // Parse JSON to find tag_name
+    if let Some(tag_start) = body.find("\"tag_name\":\"") {
+        let start = tag_start + 11;
+        if let Some(tag_end) = body[start..].find('"') {
+            let tag = &body[start..start + tag_end];
+            if tag.starts_with('v') {
+                return Some(tag.to_string());
+            }
+        }
+    }
+
+    fetch_version_alternative()
+}
+
+fn fetch_version_alternative() -> Option<String> {
+    // Alternative: Try GitHub.com website (old method but sometimes works)
+    let mut stream = match std::net::TcpStream::connect(("github.com", 80)) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+
+    let request = format!(
+        "GET /imrany/{}/releases/latest HTTP/1.1\r\n\
+         Host: github.com\r\n\
+         User-Agent: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_NAME")
+    );
+
+    if stream.write_all(request.as_bytes()).is_err() {
+        return None;
+    }
+
+    let mut reader = BufReader::new(stream);
+    for line in reader.lines().take(30).flatten() {
         if line.to_ascii_lowercase().starts_with("location:") {
             if let Some(tag) = line.rsplit('/').next() {
                 if tag.trim().starts_with('v') {
@@ -357,16 +434,6 @@ fn fetch_latest_version() -> Option<String> {
         }
     }
     None
-}
-
-fn is_newer(latest: &str, current: &str) -> bool {
-    fn parse(v: &str) -> Option<(u32,u32,u32)> {
-        let v = v.trim_start_matches('v');
-        let mut p = v.splitn(3,'.');
-        Some((p.next()?.parse().ok()?, p.next()?.parse().ok()?,
-              p.next()?.split('-').next()?.parse().ok()?))
-    }
-    matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
 }
 
 fn device_row(
@@ -4205,15 +4272,37 @@ impl App {
     }
 
     fn check_for_update(&mut self) {
-        if self.update_rx.is_some() || self.update_available.is_some() { return; }
+        if self.update_rx.is_some() || self.update_available.is_some() {
+            return;
+        }
         let current = self.version.clone();
         let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
         self.update_rx = Some(rx);
+
         thread::spawn(move || {
-            let _ = tx.send(fetch_latest_version()
-                .filter(|v| is_newer(v, &current)));
+            let latest = fetch_latest_version();
+            if let Some(latest) = latest {
+                if is_newer(&latest, &current) {
+                    let _ = tx.send(Some(latest));
+                    return;
+                }
+            }
+            let _ = tx.send(None);
         });
     }
+}
+
+fn is_newer(latest: &str, current: &str) -> bool {
+    fn parse(v: &str) -> Option<(u32, u32, u32)> {
+        let v = v.trim_start_matches('v');
+        let mut p = v.splitn(3, '.');
+        Some((
+            p.next()?.parse().ok()?,
+            p.next()?.parse().ok()?,
+            p.next()?.split('-').next()?.parse().ok()?
+        ))
+    }
+    matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
 }
 
 fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
