@@ -116,6 +116,12 @@ fn relay_listen(tx: std::sync::mpsc::Sender<RelayMsg>) {
                 return;
             }
 
+            // Check if status is 200 OK
+            if !response.contains("200 OK") {
+                let _ = tx.send(RelayMsg::Error(format!("HTTP error: {}", response.trim())));
+                return;
+            }
+
             // Read headers until empty line
             let mut line = String::new();
             while let Ok(len) = reader.read_line(&mut line) {
@@ -128,14 +134,19 @@ fn relay_listen(tx: std::sync::mpsc::Sender<RelayMsg>) {
             // Read the body (our command)
             let mut body = String::new();
             if reader.read_line(&mut body).is_ok() {
-                if body.starts_with("RECEIVER") {
+                let body_trimmed = body.trim();
+                if body_trimmed.starts_with("RECEIVER") {
                     let peer = "remote".to_string();
                     let _ = tx.send(RelayMsg::Paired { peer: peer.clone() });
 
-                    // The connection is now established - we need to keep it alive
+                    // The connection is now established - keep it alive
                     let holder = Arc::new(Mutex::new(Some(stream)));
                     let _ = tx.send(RelayMsg::Ready(holder));
+                } else {
+                    let _ = tx.send(RelayMsg::Error(format!("Unexpected response: {}", body_trimmed)));
                 }
+            } else {
+                let _ = tx.send(RelayMsg::Error("Empty response body".into()));
             }
         }
         Err(e) => {
@@ -169,6 +180,12 @@ fn relay_connect(code: &str, tx: std::sync::mpsc::Sender<RelayMsg>) {
                 return;
             }
 
+            // Check if status is 200 OK
+            if !response.contains("200 OK") {
+                let _ = tx.send(RelayMsg::Error(format!("HTTP error: {}", response.trim())));
+                return;
+            }
+
             // Read headers
             let mut line = String::new();
             while let Ok(len) = reader.read_line(&mut line) {
@@ -181,13 +198,20 @@ fn relay_connect(code: &str, tx: std::sync::mpsc::Sender<RelayMsg>) {
             // Read the body
             let mut body = String::new();
             if reader.read_line(&mut body).is_ok() {
-                if body.starts_with("SENDER") {
+                let body_trimmed = body.trim();
+                if body_trimmed.starts_with("SENDER") {
                     let peer = "remote".to_string();
                     let _ = tx.send(RelayMsg::Paired { peer: peer.clone() });
 
                     let holder = Arc::new(Mutex::new(Some(stream)));
                     let _ = tx.send(RelayMsg::Ready(holder));
+                } else if body_trimmed == "NOT_FOUND" {
+                    let _ = tx.send(RelayMsg::Error("Code not found or expired".into()));
+                } else {
+                    let _ = tx.send(RelayMsg::Error(format!("Unexpected response: {}", body_trimmed)));
                 }
+            } else {
+                let _ = tx.send(RelayMsg::Error("Empty response body".into()));
             }
         }
         Err(e) => {
@@ -891,6 +915,8 @@ pub struct App {
     network_monitor_sender: std::sync::mpsc::Sender<String>,
     is_online: bool,
     last_internet_check: std::time::Instant,
+    relay_stream: Option<Arc<Mutex<Option<TcpStream>>>>,
+    is_relay_mode: bool,
 }
 
 enum RelayMsg {
@@ -976,6 +1002,8 @@ impl Default for App {
             network_monitor_sender,
             is_online: false,
             last_internet_check: std::time::Instant::now(),
+            relay_stream: None,
+            is_relay_mode: false,
         }
     }
 }
@@ -1098,14 +1126,35 @@ impl App {
         let Some(peer) = self.selected.and_then(|i| self.peers.get(i)).cloned() else {
             return;
         };
+
         if self.queue.is_empty() {
             return;
         }
+
+        // Check if we're in relay mode
+        let use_relay = self.is_relay_mode && self.relay_stream.is_some();
+
+        // Take the relay stream if in relay mode
+        let relay_stream_opt = if use_relay {
+            if let Some(stream_arc) = &self.relay_stream {
+                if let Ok(mut guard) = stream_arc.lock() {
+                    guard.take()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         for item in &mut self.queue {
             if item.is_pending() {
                 item.progress = Some(0.0);
             }
         }
+
         let items: Vec<(usize, PathBuf, String, u64)> = self
             .queue
             .iter()
@@ -1113,21 +1162,38 @@ impl App {
             .filter(|(_, q)| q.is_active() || q.progress == Some(0.0))
             .map(|(i, q)| (i, q.path.clone(), q.name.clone(), q.size))
             .collect();
+
         let (tx, rx) = std::sync::mpsc::channel::<QueueMsg>();
         self.queue_rx = Some(rx);
         let peer_name = peer.name.clone();
+        let use_relay_clone = use_relay;
+
         thread::spawn(move || {
             for (index, path, name, size) in items {
                 let tx2 = tx.clone();
                 let pn = peer_name.clone();
                 let nm = name.clone();
-                let result = send_file_resumable(&path, &name, size, peer.addr, move |p| {
-                    let _ = tx2.send(QueueMsg::Progress { index, progress: p });
-                });
+
+                let result = if use_relay_clone {
+                    if let Some(mut stream) = relay_stream_opt {
+                        send_file_via_relay(&path, &name, size, &mut stream, move |p| {
+                            let _ = tx2.send(QueueMsg::Progress { index, progress: p });
+                        })
+                    } else {
+                        Err("No relay stream available".into())
+                    }
+                } else {
+                    // Use direct connection
+                    send_file_resumable(&path, &name, size, peer.addr, move |p| {
+                        let _ = tx2.send(QueueMsg::Progress { index, progress: p });
+                    })
+                };
+
                 let ts = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
+
                 match result {
                     Ok(()) => {
                         append_history(&HistoryEntry {
@@ -1463,7 +1529,10 @@ impl App {
                     Ok(RelayMsg::Paired { peer }) => {
                         self.relay_state = RelayState::Paired { peer_name: peer };
                     }
-                    Ok(RelayMsg::Ready(_)) => {
+                    Ok(RelayMsg::Ready(holder)) => {
+                        self.relay_stream = Some(holder.clone());  // Store the relay stream
+                        self.is_relay_mode = true;  // Enable relay mode
+
                         if let RelayState::Paired { ref peer_name } = self.relay_state {
                             let dummy_ip: std::net::IpAddr = "127.0.0.2".parse().unwrap();
                             let relay_peer = Peer {
@@ -1481,6 +1550,8 @@ impl App {
                                 self.saved_peer_addr = dummy_ip.to_string();
                                 self.tab = Tab::Send;
                             }
+                            // Start listening for incoming files via relay
+                            self.start_relay_receiver();
                         }
                         keep = false;
                     }
@@ -1728,6 +1799,50 @@ impl App {
         self.relay_rx = Some(rx);
         let code_clone = code.clone();
         thread::spawn(move || relay_connect(&code_clone, tx));
+    }
+
+    fn start_relay_receiver(&mut self) {
+        if let Some(stream_arc) = &self.relay_stream {
+            if let Ok(mut guard) = stream_arc.lock() {
+                if let Some(stream) = guard.take() {
+                    let state = Arc::clone(&self.recv_state);
+                    let save_dir = self.save_dir.clone();
+                    thread::spawn(move || {
+                        match receive_file_via_relay(stream, &save_dir) {
+                            Ok(f) => {
+                                let ts = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                append_history(&HistoryEntry {
+                                    timestamp: ts,
+                                    direction: TransferDir::Received,
+                                    file_name: f.name.clone(),
+                                    file_size: f.size,
+                                    peer_name: f.peer_name.clone(),
+                                    success: true,
+                                    error: None,
+                                    file_path: Some(f.path.clone()),
+                                });
+                                if let Ok(mut s) = state.lock() {
+                                    s.recv_bytes += f.size;
+                                    s.recv_files += 1;
+                                    if s.auto_open_folder {
+                                        open_folder(&f.path);
+                                    }
+                                    s.files.push(f);
+                                }
+                            }
+                            Err(e) => {
+                                if let Ok(mut s) = state.lock() {
+                                    s.error = Some(e);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -4544,6 +4659,239 @@ fn receive_file_resumable(
         seen: false,
         peer_name: sender_hostname,
     })
+}
+
+fn send_file_via_relay(
+    path: &std::path::Path,
+    name: &str,
+    file_size: u64,
+    relay_stream: &mut TcpStream,
+    on_progress: impl Fn(f32) + Send + 'static,
+) -> Result<(), String> {
+    // Set timeouts
+    relay_stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
+    relay_stream.set_write_timeout(Some(std::time::Duration::from_secs(300)))?;
+
+    // Key exchange
+    let sender_secret = EphemeralSecret::random_from_rng(AeadOsRng);
+    let sender_pub = PublicKey::from(&sender_secret);
+    relay_stream
+        .write_all(sender_pub.as_bytes())
+        .map_err(|e| e.to_string())?;
+    relay_stream.flush().map_err(|e| e.to_string())?;
+
+    let mut recv_pub_bytes = [0u8; X25519_KEY_LEN];
+    relay_stream
+        .read_exact(&mut recv_pub_bytes)
+        .map_err(|e| e.to_string())?;
+
+    let receiver_pub = PublicKey::from(recv_pub_bytes);
+    let shared = sender_secret.diffie_hellman(&receiver_pub);
+    let aes_key = derive_key(shared.as_bytes());
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
+
+    // Send offer with file info
+    let nb = name.as_bytes();
+    let hn = hostname();
+    let hb = hn.as_bytes();
+    let mut offer = Vec::with_capacity(1 + 4 + nb.len() + 8 + 4 + hb.len());
+    offer.push(MAGIC_OFFER);
+    offer.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+    offer.extend_from_slice(nb);
+    offer.extend_from_slice(&file_size.to_le_bytes());
+    offer.extend_from_slice(&(hb.len() as u32).to_le_bytes());
+    offer.extend_from_slice(hb);
+    write_encrypted(relay_stream, &cipher, &offer)?;
+    relay_stream.flush().map_err(|e| e.to_string())?;
+
+    // Wait for resume response
+    let mut magic_buf = [0u8; 1];
+    relay_stream
+        .read_exact(&mut magic_buf)
+        .map_err(|e| e.to_string())?;
+    if magic_buf[0] != MAGIC_RESUME {
+        return Err("Bad handshake response".into());
+    }
+
+    let resume_payload = read_encrypted(relay_stream, &cipher)?;
+    if resume_payload.len() < 8 {
+        return Err("Short resume payload".into());
+    }
+    let resume_offset = u64::from_le_bytes(resume_payload[..8].try_into().unwrap());
+
+    // Send file data
+    let mut file = fs::File::open(path).map_err(|e| format!("Cannot open: {}", e))?;
+    if resume_offset > 0 {
+        file.seek(SeekFrom::Start(resume_offset))
+            .map_err(|e| e.to_string())?;
+    }
+    let mut sent = resume_offset;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        relay_stream.write_all(&[MAGIC_DATA]).map_err(|e| e.to_string())?;
+        write_encrypted(relay_stream, &cipher, &buf[..n])?;
+        sent += n as u64;
+        if file_size > 0 {
+            on_progress(sent as f32 / file_size as f32);
+        }
+    }
+    relay_stream.write_all(&[MAGIC_DONE]).map_err(|e| e.to_string())?;
+    relay_stream.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn receive_file_via_relay(
+    mut relay_stream: TcpStream,
+    save_dir: &std::path::Path,
+) -> Result<ReceivedFile, String> {
+    let sender_ip = relay_stream
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "relay".to_string());
+
+    // Key exchange
+    let mut sender_pub_bytes = [0u8; X25519_KEY_LEN];
+    relay_stream
+        .read_exact(&mut sender_pub_bytes)
+        .map_err(|e| e.to_string())?;
+    let sender_pub = PublicKey::from(sender_pub_bytes);
+
+    let receiver_secret = EphemeralSecret::random_from_rng(AeadOsRng);
+    let receiver_pub = PublicKey::from(&receiver_secret);
+    relay_stream
+        .write_all(receiver_pub.as_bytes())
+        .map_err(|e| e.to_string())?;
+    relay_stream.flush().map_err(|e| e.to_string())?;
+
+    let shared = receiver_secret.diffie_hellman(&sender_pub);
+    let aes_key = derive_key(shared.as_bytes());
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
+
+    // Read offer
+    let offer = read_encrypted(&mut relay_stream, &cipher)?;
+    if offer.is_empty() || offer[0] != MAGIC_OFFER {
+        return Err("Bad offer".into());
+    }
+    if offer.len() < 5 {
+        return Err("Offer too short".into());
+    }
+
+    let name_len = u32::from_le_bytes(offer[1..5].try_into().unwrap()) as usize;
+    if name_len == 0 || name_len > 4096 {
+        return Err("Bad name length".into());
+    }
+    if offer.len() < 5 + name_len + 8 {
+        return Err("Truncated offer".into());
+    }
+
+    let name = String::from_utf8_lossy(&offer[5..5 + name_len]).to_string();
+    let file_size = u64::from_le_bytes(offer[5 + name_len..5 + name_len + 8].try_into().unwrap());
+    if file_size > 8 * 1024 * 1024 * 1024 {
+        return Err("File too large (>8 GB)".into());
+    }
+
+    let base = 5 + name_len + 8;
+    let sender_hostname: String = if offer.len() >= base + 4 {
+        let hn_len = u32::from_le_bytes(offer[base..base + 4].try_into().unwrap()) as usize;
+        if hn_len > 0 && hn_len <= 256 && offer.len() >= base + 4 + hn_len {
+            String::from_utf8_lossy(&offer[base + 4..base + 4 + hn_len]).to_string()
+        } else {
+            sender_ip.clone()
+        }
+    } else {
+        sender_ip.clone()
+    };
+
+    // Create save directory and file path
+    let _ = fs::create_dir_all(save_dir);
+    let dest = unique_path(save_dir, &name);
+
+    // Send resume response (start from beginning)
+    relay_stream
+        .write_all(&[MAGIC_RESUME])
+        .map_err(|e| e.to_string())?;
+    write_encrypted(&mut relay_stream, &cipher, &0u64.to_le_bytes())?;
+    relay_stream.flush().map_err(|e| e.to_string())?;
+
+    // Receive file data
+    let mut file = fs::File::create(&dest).map_err(|e| format!("Cannot create file: {}", e))?;
+    let mut received = 0u64;
+    let mut magic = [0u8; 1];
+
+    loop {
+        relay_stream.read_exact(&mut magic).map_err(|e| e.to_string())?;
+        match magic[0] {
+            MAGIC_DATA => {
+                let pt = read_encrypted(&mut relay_stream, &cipher)?;
+                file.write_all(&pt).map_err(|e| e.to_string())?;
+                received += pt.len() as u64;
+            }
+            MAGIC_DONE => break,
+            other => return Err(format!("Unknown packet 0x{:02x}", other)),
+        }
+    }
+
+    if received != file_size {
+        return Err(format!("Size mismatch: {} vs {}", file_size, received));
+    }
+
+    let _ = notify(
+        &format!("{} — File Received", env!("CARGO_PKG_NAME")),
+        &format!(
+            "'{}' saved to {}",
+            truncate_filename(&name, 45),
+            save_dir.display()
+        ),
+    );
+
+    Ok(ReceivedFile {
+        name,
+        size: file_size,
+        path: dest,
+        seen: false,
+        peer_name: sender_hostname,
+    })
+}
+
+fn receive_server_relay(relay_stream: TcpStream, state: Arc<Mutex<RecvState>>, save_dir: PathBuf) {
+    thread::spawn(move || {
+        match receive_file_via_relay(relay_stream, &save_dir) {
+            Ok(f) => {
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                append_history(&HistoryEntry {
+                    timestamp: ts,
+                    direction: TransferDir::Received,
+                    file_name: f.name.clone(),
+                    file_size: f.size,
+                    peer_name: f.peer_name.clone(),
+                    success: true,
+                    error: None,
+                    file_path: Some(f.path.clone()),
+                });
+                if let Ok(mut s) = state.lock() {
+                    s.recv_bytes += f.size;
+                    s.recv_files += 1;
+                    let auto_open = s.auto_open_folder;
+                    if auto_open {
+                        open_folder(&f.path);
+                    }
+                    s.files.push(f);
+                }
+            }
+            Err(e) => {
+                if let Ok(mut s) = state.lock() {
+                    s.error = Some(e);
+                }
+            }
+        }
+    });
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────

@@ -1,43 +1,43 @@
-# /etc/nginx/sites-available/default
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name relay.example.com;
+# sudo nano /etc/nginx/nginx.conf
+load_module /usr/lib/nginx/modules/ngx_stream_module.so;
 
-    ssl_certificate /etc/letsencrypt/live/relay.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
 
-    location / {
-        proxy_pass http://127.0.0.1:9000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_connect_timeout 75s;
-    }
+events {
+    worker_connections 768;
+    # multi_accept on;
 }
 
-# http to https redirect
-server {
-    if ($host = www.relay.example.com) {
-        return 301 https://$host$request_uri;
-    } # managed by Certbot
+# ... rest of your config ...
 
+---
 
-    if ($host = relay.example.com) {
-        return 301 https://$host$request_uri;
-    } # managed by Certbot
+# sudo nano /etc/nginx/conf.d/relay-stream.conf
+stream {
+    upstream relay_backend {
+        server 127.0.0.1:9000;
+    }
 
+    server {
+        listen 443 ssl;
+        listen [::]:443 ssl;
 
-    server_name relay.example.com www.relay.example.com;
-    listen 80;
-    return 404; # managed by Certbot
+        server_name relay.example.com www.relay.example.com;
+
+        ssl_certificate /etc/letsencrypt/live/relay.example.com/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
+        include /etc/letsencrypt/options-ssl-nginx.conf;
+        ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+
+        proxy_pass relay_backend;
+        proxy_connect_timeout 1s;
+        proxy_timeout 3600s;
+        proxy_buffer_size 4k;
+    }
 }

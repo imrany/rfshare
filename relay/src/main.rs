@@ -1,14 +1,14 @@
 // Run: cargo run --release -- 0.0.0.0:9000
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write, ErrorKind};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration};
 
 type WaitMap = Arc<Mutex<HashMap<String, (TcpStream, Instant)>>>;
+type SharedStats = Arc<Mutex<Stats>>;
 
-// ─── Stats ────────────────────────────────────────────────────────────────────
 #[derive(Default)]
 struct Stats {
     total_connections: u64,
@@ -17,9 +17,6 @@ struct Stats {
     active_pipes:      u32,
 }
 
-type SharedStats = Arc<Mutex<Stats>>;
-
-// ─── Logging ──────────────────────────────────────────────────────────────────
 fn now_str() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -50,7 +47,6 @@ macro_rules! info  { ($($a:tt)*) => { log!("INFO ", $($a)*) } }
 macro_rules! warn  { ($($a:tt)*) => { log!("WARN ", $($a)*) } }
 macro_rules! error { ($($a:tt)*) => { log!("ERROR", $($a)*) } }
 
-// ─── Bidirectional pipe ───────────────────────────────────────────────────────
 fn pipe(
     mut a: TcpStream,
     mut b: TcpStream,
@@ -83,7 +79,7 @@ fn pipe(
                 }
                 Err(e) => warn!("PIPE_ERR  code={}  dir=sender->receiver  err={}", code2, e),
             }
-            b2.shutdown(std::net::Shutdown::Write).ok();
+            let _ = b2.shutdown(std::net::Shutdown::Write);
         });
     }
 
@@ -100,16 +96,19 @@ fn pipe(
                     info!("PIPE_DONE  code={}  dir=receiver->sender  bytes={}", code3, n);
                 }
                 Err(e) => {
-                    stats3.lock().unwrap().active_pipes = stats3.lock().unwrap().active_pipes.saturating_sub(1);
+                    let mut s = stats3.lock().unwrap();
+                    s.active_pipes = s.active_pipes.saturating_sub(1);
                     warn!("PIPE_ERR  code={}  dir=receiver->sender  err={}", code3, e);
                 }
             }
-            a2.shutdown(std::net::Shutdown::Write).ok();
+            let _ = a2.shutdown(std::net::Shutdown::Write);
         });
     }
+    // Drop original streams to close cleanly
+    drop(a);
+    drop(b);
 }
 
-// ─── Handle HTTP request ────────────────────────────────────────────────────────
 fn handle_http_request(mut stream: TcpStream, peer: &str) -> Option<String> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut first_line = String::new();
@@ -119,33 +118,30 @@ fn handle_http_request(mut stream: TcpStream, peer: &str) -> Option<String> {
         Ok(_) => {
             info!("HTTP request from {}: {}", peer, first_line.trim());
 
-            // Parse the path to extract code
-            let parts: Vec<&str> = first_line.split_whitespace().collect();
+            let parts: Vec<&str> = first_line.trim().split_whitespace().collect();
             if parts.len() >= 2 {
                 let path = parts[1];
 
-                // Handle receiver endpoint
                 if path.starts_with("/receiver/") {
                     let code = path.strip_prefix("/receiver/").unwrap_or("");
                     if !code.is_empty() {
                         info!("Receiver request for code: {}", code);
-                        // Read and discard remaining headers
+                        // Read and discard remaining headers - FIXED
                         let mut line = String::new();
-                        while let Ok(len) = reader.read_line(&mut line) {
-                            if len == 0 || line == "\r\n" || line == "\n" {
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).map_or(true, |len| len == 0 || line.trim().is_empty()) {
                                 break;
                             }
-                            line.clear();
                         }
 
-                        // Send HTTP response
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: text/plain\r\n\
-                             Connection: keep-alive\r\n\
-                             Content-Length: {}\r\n\
-                             \r\n\
-                             RECEIVER {}\r\n",
+r#"HTTP/1.1 200 OK
+Content-Type: text/plain
+Connection: keep-alive
+Content-Length: {}
+
+RECEIVER {}"#,
                             format!("RECEIVER {}", code).len(),
                             code
                         );
@@ -154,28 +150,26 @@ fn handle_http_request(mut stream: TcpStream, peer: &str) -> Option<String> {
                         return Some(format!("RECEIVER {}", code));
                     }
                 }
-                // Handle sender endpoint
                 else if path.starts_with("/sender/") {
                     let code = path.strip_prefix("/sender/").unwrap_or("");
                     if !code.is_empty() {
                         info!("Sender request for code: {}", code);
-                        // Read and discard remaining headers
+                        // Read and discard remaining headers - FIXED
                         let mut line = String::new();
-                        while let Ok(len) = reader.read_line(&mut line) {
-                            if len == 0 || line == "\r\n" || line == "\n" {
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).map_or(true, |len| len == 0 || line.trim().is_empty()) {
                                 break;
                             }
-                            line.clear();
                         }
 
-                        // Send HTTP response
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: text/plain\r\n\
-                             Connection: keep-alive\r\n\
-                             Content-Length: {}\r\n\
-                             \r\n\
-                             SENDER {}\r\n",
+r#"HTTP/1.1 200 OK
+Content-Type: text/plain
+Connection: keep-alive
+Content-Length: {}
+
+SENDER {}"#,
                             format!("SENDER {}", code).len(),
                             code
                         );
@@ -193,7 +187,6 @@ fn handle_http_request(mut stream: TcpStream, peer: &str) -> Option<String> {
     None
 }
 
-// ─── Handle raw TCP command ────────────────────────────────────────────────────
 fn handle_raw_command(stream: TcpStream, peer: &str) -> Option<String> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut line = String::new();
@@ -207,7 +200,6 @@ fn handle_raw_command(stream: TcpStream, peer: &str) -> Option<String> {
     }
 }
 
-// ─── Connection handler ───────────────────────────────────────────────────────
 fn handle(stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
     let peer = stream.peer_addr()
         .map(|a| a.to_string())
@@ -215,15 +207,20 @@ fn handle(stream: TcpStream, waiting: WaitMap, stats: SharedStats) {
 
     { stats.lock().unwrap().total_connections += 1; }
 
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(130))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(130))).ok();
 
-    // Peek to see if it's HTTP
-    let mut peek_buf = [0u8; 4];
+    // FIXED: Better HTTP detection
+    let mut peek_buf = [0u8; 8];
     let command = match stream.peek(&mut peek_buf) {
         Ok(n) if n > 0 => {
-            // Check if it's HTTP (starts with G, P, H)
-            if peek_buf[0] == b'G' || peek_buf[0] == b'P' || peek_buf[0] == b'H' {
-                handle_http_request(stream.try_clone().unwrap(), &peer)
+            // Check for HTTP methods more comprehensively
+            if let Ok(s) = std::str::from_utf8(&peek_buf[..n.min(7)]) {
+                if s.starts_with("GET ") || s.starts_with("POST ") || s.starts_with("HEAD ") ||
+                   s.starts_with("PUT ") || s.starts_with("OPT ") || s.starts_with("DEL ") {
+                    handle_http_request(stream.try_clone().unwrap(), &peer)
+                } else {
+                    handle_raw_command(stream.try_clone().unwrap(), &peer)
+                }
             } else {
                 handle_raw_command(stream.try_clone().unwrap(), &peer)
             }
@@ -246,7 +243,6 @@ fn process_command(
     waiting: WaitMap,
     stats: SharedStats,
 ) {
-    // ── RECEIVER <code> ───────────────────────────────────────────────────
     if let Some(code) = line.strip_prefix("RECEIVER ") {
         let code = code.trim().to_string();
         if code.is_empty() {
@@ -256,13 +252,11 @@ fn process_command(
         }
         info!("RECEIVER_WAITING  peer={}  code={}", peer, code);
 
-        // If a stale entry exists with the same code, log it
         if waiting.lock().unwrap().contains_key(&code) {
             warn!("CODE_COLLISION  code={}  new_peer={}  (replacing stale)", code, peer);
         }
         waiting.lock().unwrap().insert(code, (stream, Instant::now()));
 
-    // ── SENDER <code> ─────────────────────────────────────────────────────
     } else if let Some(code) = line.strip_prefix("SENDER ") {
         let code = code.trim().to_string();
         if code.is_empty() {
@@ -281,7 +275,6 @@ fn process_command(
                 info!("PAIRING  code={}  sender={}  receiver={}  wait_ms={}",
                     code, peer, recv_addr, wait_ms);
 
-                // Notify receiver: "PAIRED <sender_ip>"
                 if let Err(e) = writeln!(recv_stream, "PAIRED {}", peer) {
                     error!("NOTIFY_RECEIVER_FAIL  code={}  err={}", code, e);
                     let _ = writeln!(stream, "NOT_FOUND");
@@ -289,7 +282,6 @@ fn process_command(
                 }
                 recv_stream.flush().ok();
 
-                // Notify sender: "PAIRED receiver"
                 if let Err(e) = writeln!(stream, "PAIRED receiver") {
                     error!("NOTIFY_SENDER_FAIL  code={}  err={}", code, e);
                     return;
@@ -305,14 +297,20 @@ fn process_command(
             }
         }
 
-    // ── Unknown ───────────────────────────────────────────────────────────
     } else {
         warn!("UNKNOWN_CMD  peer={}  line={:?}", peer, &line[..line.len().min(80)]);
         let _ = writeln!(stream, "BAD_REQUEST");
     }
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+fn format_bytes(b: u64) -> String {
+    const U: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 { v /= 1024.0; i += 1; }
+    if i == 0 { format!("{} B", b) } else { format!("{:.1} {}", v, U[i]) }
+}
+
 fn main() {
     let addr     = std::env::args().nth(1).unwrap_or_else(|| "0.0.0.0:9000".into());
     let listener = TcpListener::bind(&addr).expect("Cannot bind");
@@ -322,50 +320,53 @@ fn main() {
     let waiting: WaitMap    = Arc::new(Mutex::new(HashMap::new()));
     let stats:   SharedStats = Arc::new(Mutex::new(Stats::default()));
 
-    // ── Expiry + stats thread ─────────────────────────────────────────────
+    // FIXED: Better expiry with minimal lock contention
     {
         let w = Arc::clone(&waiting);
         let s = Arc::clone(&stats);
         thread::spawn(move || loop {
-            thread::sleep(std::time::Duration::from_secs(300));
+            thread::sleep(Duration::from_secs(300));
 
-            // Expire sessions older than 5 minutes
-            let mut map    = w.lock().unwrap();
-            let before     = map.len();
-            map.retain(|code, (_, ts)| {
-                let keep = ts.elapsed().as_secs() < 300;
-                if !keep { info!("SESSION_EXPIRED  code={}", code); }
-                keep
-            });
-            let expired = before - map.len();
-            let waiting_now = map.len();
-            drop(map);
+            let expired_codes: Vec<String>;
+            {
+                let mut map = w.lock().unwrap();
+                let before = map.len();
+                let keys: Vec<String> = map.keys().cloned().collect();
+                expired_codes = keys.into_iter()
+                    .filter(|code| {
+                        if let Some((_, ts)) = map.get(code) {
+                            let elapsed = ts.elapsed().as_secs();
+                            if elapsed >= 300 {
+                                info!("SESSION_EXPIRED  code={}", code);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    })
+                    .collect();
+                for code in &expired_codes {
+                    map.remove(code);
+                }
+            }
 
-            // Print periodic stats
+            let waiting_now = w.lock().unwrap().len();
             let st = s.lock().unwrap();
             info!(
                 "STATS  connections={}  pairings={}  bytes_piped={}  \
                  active_pipes={}  waiting_receivers={}  expired={}",
                 st.total_connections, st.total_pairings,
                 format_bytes(st.total_bytes_piped),
-                st.active_pipes, waiting_now, expired
+                st.active_pipes, waiting_now, expired_codes.len()
             );
         });
     }
 
-    // ── Accept loop ───────────────────────────────────────────────────────
     for stream in listener.incoming().flatten() {
         let w = Arc::clone(&waiting);
         let s = Arc::clone(&stats);
         thread::spawn(move || handle(stream, w, s));
     }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-fn format_bytes(b: u64) -> String {
-    const U: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut v = b as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < U.len() - 1 { v /= 1024.0; i += 1; }
-    if i == 0 { format!("{} B", b) } else { format!("{:.1} {}", v, U[i]) }
 }
