@@ -1,46 +1,32 @@
 # RFSHARE
-**rfshare** is a P2P encrypted file-sharing application built with Rust and the egui framework. It leverages a modern cryptographic stack, including X25519 for key exchange and AES-256-GCM for authenticated data encryption. 
 
-## Core Architecture and Features
+**rfshare** is a modern, encrypted peer-to-peer file sharing application built with Rust and the egui framework. It enables fast, secure file transfers between devices on the same network or across the internet using a relay server.
 
-* Remote sharing: Support remote file sharing and folder syncing. You can share around the global.
-* Folder Synchronization: The "Pro" version (validated via a simple salted hash mechanism) supports automated folder monitoring, where it periodically polls specific directories for changes and syncs them with a linked device.
-* LAN Device Discovery: The application uses a dedicated UDP discovery port (44444) to find other instances of the software on the local network using a "RFSHARE_DISCOVER" broadcast message.
-* Encrypted Transfers: After discovery, peers establish a secure connection on port 44445. It implements an ephemeral key exchange where a shared secret is derived to encrypt file chunks with AES-GCM.
-* Modern UI: The interface uses egui with a custom color palette (supporting Light/Dark modes) and integrates Material Design icons via the [egui_material_icons](https://crates.io/crates/egui_material_icons) crate.
-* Persistence: User preferences, selected peer addresses, and transfer history are stored locally in the OS's config directory (e.g., AppData on Windows) using simple JSON-free flat files and CSV formats.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue.svg)](https://github.com/imrany/rfshare)
 
-**What it does in plain terms:** it lets two computers on the same Wi-Fi or LAN send files to each other directly — no internet, no cloud, no accounts, no cables.
+## ✨ Features
 
-## How it works end-to-end
+### Core Features
+- **🔒 End-to-End Encrypted Transfers** - X25519 key exchange + AES-256-GCM encryption for all transfers
+- **🌐 Local Network Discovery** - Automatic device discovery via UDP broadcast on port 44444
+- **📁 Folder Synchronization** - Automatically sync folders with selected devices (Pro feature)
+- **🌍 Remote File Sharing** - Share files across the internet via relay server (Pro feature)
+- **📊 Transfer History** - Complete log of all sent and received files with search functionality
+- **🎨 Modern UI** - Clean interface with dark/light theme support
+- **🖱️ Drag & Drop** - Simply drag files into the app to add them to the queue
+- **📱 Cross-Platform** - Works on Windows, macOS, and Linux
 
-When you open the app, a background thread immediately starts listening on two ports — UDP 44444 for discovery and TCP 44445 for receiving files. This means the moment the app is running, it is already ready to receive.
+### Technical Highlights
+- **Resumable Transfers** - Interrupted transfers can be resumed from where they stopped
+- **Real-time Progress** - Visual progress bars for all active transfers
+- **Desktop Notifications** - System notifications when files are received
+- **Smart Sync** - Only syncs files that have changed (uses modification timestamps)
+- **Network Monitoring** - Automatically detects IP changes and reconnects
+- **No Cloud Storage** - Files never leave your devices or relay server (relay only pipes encrypted data)
 
-On the **Send tab**, you hit Scan. The app broadcasts a UDP ping to your local network. Every other device running rfshare hears that ping and replies with its hostname. Within about 2 seconds you see a list of available devices as clickable cards. You pick one, attach a file either by browsing or dragging and dropping it onto the window, then hit Send. The file is read into memory and streamed over a direct TCP connection to the selected device.
-
-On the receiving side, the file arrives, gets saved to the Downloads folder (with automatic rename if a file by that name already exists), and a desktop notification fires — `notify-send` on Linux, `osascript` on macOS, a PowerShell toast on Windows. The **Received tab** lights up with a green dot and a NEW badge on the file card. Clicking "Open folder" opens the save location in your file manager.
-
-**What it does not do:** it does not use the internet, it does not compress or encrypt the transfer, it does not support sending to multiple devices at once, and it does not resume interrupted transfers. It is intentionally simple — point, pick, send.
-
-## What works
-
-- ✅ Local network file sharing
-
-- ✅ Remote file sharing via relay server
-
-- ✅ Folder sync for both local and remote
-
-- ✅ Transfer history with remote/local tracking
-
-- ✅ System theme detection
-
-- ✅ Cross-platform support (Windows, Mac, Linux)
-
-- ✅ End-to-end encryption
-
-- ✅ Resume capability for interrupted transfers
-
-## Demonstration
+## 📸 Demonstration
 
 <table>
   <tr>
@@ -48,31 +34,30 @@ On the receiving side, the file arrives, gets saved to the Downloads folder (wit
     <td align="center"><b>2. Sending a file</b></td>
   </tr>
   <tr>
-    <td><img src="./assets/rfshare_scan.png" alt="Scan Image" width="400" height="500"/></td>
-    <td><img src="./assets/rfshare_send.png" alt="Send Image" width="400" height="500"/></td>
+    <td align="center"><img src="./assets/rfshare_scan.png" alt="Scan Image" width="400" height="500"/></td>
+    <td align="center"><img src="./assets/rfshare_send.png" alt="Send Image" width="400" height="500"/></td>
   </tr>
   <tr>
     <td align="center"><b>3. Receiving a file</b></td>
-    <td align="center"><b>4. Receive tab</b></td>
+    <td align="center"><b>4. History tab</b></td>
   </tr>
   <tr>
-    <td><img src="./assets/rfshare_receive.png" alt="Received Image" width="400" height="500"/></td>
-    <td><img src="./assets/rfshare_received_tab.png" alt="Receive Tab Image" width="400" height="500"/></td>
+    <td align="center"><img src="./assets/rfshare_receive.png" alt="Received Image" width="400" height="500"/></td>
+    <td align="center"><img src="./assets/rfshare_received_tab.png" alt="History Tab Image" width="400" height="500"/></td>
   </tr>
   <tr>
-    <td align="center"><b>5. Sync a folder (Pro feature)</b></td>
+    <td align="center" colspan="2"><b>5. Sync a folder (Pro feature)</b></td>
   </tr>
   <tr>
-    <td><img src="./assets/rfshare_sync.png" alt="Sync Image" width="400" height="500"/></td>
+    <td align="center" colspan="2"><img src="./assets/rfshare_sync.png" alt="Sync Image" width="400" height="500"/></td>
   </tr>
 </table>
 
-## Installation
+## 🚀 Quick Start
 
-Available in `Windows`, `Linux` and `MacOS`
+### Installation
 
-### 🐧 Linux
-
+#### 🐧 Linux
 ```bash
 curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash
 ```
@@ -85,8 +70,7 @@ Falls back to a bare binary on other distros.
 > PREFIX=$HOME/.local curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash
 > ```
 
-### 🍎 macOS
-
+#### 🍎 macOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash
 ```
@@ -94,8 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install
 Installs the `.dmg` when available, otherwise builds a `.app` bundle and copies it to `/Applications`.  
 Also installs the `rfshare` CLI to `/usr/local/bin`.
 
-### 🪟 Windows
-
+#### 🪟 Windows
 Paste this into **PowerShell** (no admin needed):
 
 ```powershell
@@ -143,12 +126,214 @@ All binaries and installers are on the [Releases](https://github.com/imrany/rfsh
 
 Each file has a matching `.sha256` checksum.
 
-### Pro Key License
+### Basic Usage
 
-Go to `Settings` > `License` and paste this key
+1. **Start the app** - It automatically starts listening for incoming files
+2. **Send files locally**:
+   - Click the **Scan** tab
+   - Click **Scan** to discover devices on your network
+   - Select a device from the list
+   - Go to **Send** tab
+   - Drag and drop files or click **Browse**
+   - Click **Send**
 
+3. **Receive files**:
+   - Files are automatically saved to your Downloads folder
+   - Desktop notifications appear when transfers complete
+   - View received files in the **History** tab
+
+4. **Remote sharing (Pro)**:
+   - **Receiver**: Click **Scan** → **Remote** → **Go Online** → Share the code
+   - **Sender**: Click **Scan** → **Remote** → Enter code → **Connect** → Send files
+
+5. **Folder sync (Pro)**:
+   - Select a device
+   - Go to **Sync** tab
+   - Click **Set folder to watch**
+   - Click **Start watching**
+   - Any new files in the folder auto-sync to the selected device
+
+## 🔧 Architecture
+
+### Network Protocols
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 44444 | UDP | Device discovery broadcast |
+| 44445 | TCP | Encrypted file transfer |
+
+### Security Stack
+
+```
+┌─────────────────────────────────────────────┐
+│           Application Layer                 │
+├─────────────────────────────────────────────┤
+│         AES-256-GCM (Authenticated)         │
+├─────────────────────────────────────────────┤
+│    X25519 ECDH (Key Exchange)               │
+├─────────────────────────────────────────────┤
+│    TCP Socket (Direct or Relay)             │
+└─────────────────────────────────────────────┘
+```
+
+### Transfer Flow
+
+1. **Discovery** - UDP broadcast finds peers on the network
+2. **Key Exchange** - X25519 ephemeral key exchange for perfect forward secrecy
+3. **Encryption** - AES-256-GCM encrypts all file data
+4. **Transfer** - Chunked transfer with resume capability
+5. **Verification** - GCM authentication ensures integrity
+
+## 📊 Features Comparison
+
+| Feature | Free | Pro |
+|---------|------|-----|
+| Local Network Transfer | ✅ | ✅ |
+| Direct File Transfer | ✅ | ✅ |
+| Encrypted Transfer | ✅ | ✅ |
+| Transfer History | ✅ | ✅ |
+| Drag & Drop | ✅ | ✅ |
+| Desktop Notifications | ✅ | ✅ |
+| **Remote Transfer** | ❌ | ✅ |
+| **Folder Sync** | ❌ | ✅ |
+| **Remote Folder Sync** | ❌ | ✅ |
+| **Unlimited Devices** | ❌ | ✅ |
+| **Organization License** | ❌ | ✅ |
+
+## 💰 Pro License
+
+### Activate Pro
+
+1. Go to **Settings** → **License**
+2. Enter your license key
+3. Click **Activate**
+
+**Pro License Key:**
 ```bash
 29714-5B90A-54A40-254F4-B7B1C
 ```
 
-Support development on [GitHub Sponsors](https://github.com/sponsors/imrany)
+### Get a License
+
+Support development and get Pro features:
+- [GitHub Sponsors](https://github.com/sponsors/imrany)
+- Includes remote sharing and folder sync
+- Helps fund continued development
+
+## 🏗️ Building from Source
+
+### Prerequisites
+- Rust 1.70 or later
+- Cargo package manager
+
+### Build
+```bash
+# Clone the repository
+git clone https://github.com/imrany/rfshare.git
+cd rfshare
+
+# Build in release mode
+cargo build --release
+
+# Run the application
+./target/release/rfshare
+```
+
+## 📁 File Locations
+
+### Configuration
+- **Windows**: `%APPDATA%\rfshare\`
+- **Linux**: `~/.config/rfshare/`
+- **macOS**: `~/Library/Application Support/rfshare/`
+
+### Files
+- `prefs.json` - User preferences and settings
+- `history.csv` - Transfer history log
+- `license` - Pro license information
+
+## 🔐 Security Details
+
+### Key Exchange Process
+1. Both peers generate ephemeral X25519 keypairs
+2. Public keys are exchanged over the TCP connection
+3. Shared secret is derived using Diffie-Hellman
+4. AES-256-GCM key is derived using SHA-256 with app-specific salt
+5. All subsequent communication uses the derived key
+
+### Encryption Features
+- **Perfect Forward Secrecy** - Session keys are not stored
+- **Authenticated Encryption** - GCM mode provides integrity checking
+- **Per-Connection Keys** - Unique keys for each transfer
+- **No Key Reuse** - Fresh keys for every session
+
+## 🐛 Troubleshooting
+
+### Common Issues
+
+**Q: Can't see devices on the network**
+- Ensure both devices are on the same network/subnet
+- Check if firewall is blocking UDP port 44444
+- Try running as administrator (Windows) or with sudo (Linux)
+
+**Q: Remote connection fails**
+- Verify internet connectivity
+- Ensure the relay server is accessible
+- Check if port 443 is open (for HTTPS) or port 80 (for HTTP)
+
+**Q: Transfer is slow**
+- Direct transfers are limited by your network speed
+- Remote transfers go through the relay server
+- Try using a wired connection for large files
+
+**Q: Can't find the app after installation**
+- **Windows**: Start Menu → rfshare
+- **macOS**: Applications folder → rfshare.app
+- **Linux**: Run `rfshare` in terminal or find in application menu
+
+**Q: Folder sync isn't working**
+- Ensure you have a Pro license activated
+- Check that the selected device is online
+- Verify the folder exists and is readable
+- Look at the Activity log for errors
+
+## 🤝 Contributing
+
+Contributions are welcome! Areas where help is needed:
+
+- **UI/UX improvements** - Enhance the egui interface
+- **Performance optimizations** - Faster transfers, better chunking
+- **Additional protocols** - WebRTC, QUIC support
+- **Mobile versions** - iOS/Android ports
+- **Documentation** - Improve this README and code comments
+
+### Development Setup
+```bash
+# Clone and build
+git clone https://github.com/imrany/rfshare.git
+cd rfshare
+cargo build
+
+# Run with logging
+RUST_LOG=debug cargo run
+
+# Run tests
+cargo test
+```
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🙏 Acknowledgments
+
+- [egui](https://github.com/emilk/egui) - Immediate mode GUI library
+- [RustCrypto](https://github.com/RustCrypto) - Cryptographic implementations
+- [x25519-dalek](https://github.com/dalek-cryptography/x25519-dalek) - X25519 implementation
+- [egui_material_icons](https://crates.io/crates/egui_material_icons) - Material Design icons
+
+## 📞 Support
+
+- **Issues**: [GitHub Issues](https://github.com/imrany/rfshare/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/imrany/rfshare/discussions)
+
+**rfshare** - Fast, secure, and simple file sharing for everyone.
