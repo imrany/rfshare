@@ -10,7 +10,7 @@ use egui_material_icons::icons;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write, BufRead, BufReader,};
+use std::io::{Read, Seek, SeekFrom, Write, BufRead, BufReader};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -347,49 +347,36 @@ fn toggle_switch(ui: &mut egui::Ui, p: &Pal, on: bool) -> egui::Response {
     resp
 }
 
+/// Fetch the latest version from GitHub releases
 fn fetch_latest_version() -> Option<String> {
-    let mut stream = match std::net::TcpStream::connect(("api.github.com", 443)) {
-        Ok(s) => s,
-        Err(_) => {
-            // Fallback to alternative method
-            return fetch_version_alternative();
-        }
-    };
-
-    // Use HTTPS
-    use std::io::Write;
-    let request = format!(
-        "GET /repos/imrany/{}/releases/latest HTTP/1.1\r\n\
-         Host: api.github.com\r\n\
-         User-Agent: {}\r\n\
-         Accept: application/vnd.github.v3+json\r\n\
-         Connection: close\r\n\
-         \r\n",
-        env!("CARGO_PKG_NAME"),
+    let url = format!(
+        "https://api.github.com/repos/imrany/{}/releases/latest",
         env!("CARGO_PKG_NAME")
     );
 
-    if stream.write_all(request.as_bytes()).is_err() {
-        return fetch_version_alternative();
-    }
-
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-
-    // Read headers
-    while let Ok(line) = reader.read_line(&mut response) {
-        if line == 0 || response.ends_with("\r\n\r\n") || response.ends_with("\n\n") {
-            break;
+    match minreq::get(url)
+        .with_timeout(5)
+        .with_header("User-Agent", format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+        .send()
+    {
+        Ok(response) => {
+            if response.status_code == 200 {
+                parse_version_from_json(response.as_str().ok()?)
+            } else {
+                eprintln!("GitHub API returned status: {}", response.status_code);
+                None
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to check for updates: {}", e);
+            None
         }
     }
+}
 
-    // Read body
-    let mut body = String::new();
-    if reader.read_to_string(&mut body).is_err() {
-        return fetch_version_alternative();
-    }
-
-    // Parse JSON to find tag_name
+/// Parse version from GitHub API JSON response
+fn parse_version_from_json(body: &str) -> Option<String> {
+    // Look for "tag_name":"vX.X.X"
     if let Some(tag_start) = body.find("\"tag_name\":\"") {
         let start = tag_start + 11;
         if let Some(tag_end) = body[start..].find('"') {
@@ -399,44 +386,26 @@ fn fetch_latest_version() -> Option<String> {
             }
         }
     }
-
-    fetch_version_alternative()
+    None
 }
 
-fn fetch_version_alternative() -> Option<String> {
-    // Alternative: Try GitHub.com website (old method but sometimes works)
-    let mut stream = match std::net::TcpStream::connect(("github.com", 80)) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
+/// Compare two version strings and return true if latest > current
+fn is_newer(latest: &str, current: &str) -> bool {
+    fn parse(v: &str) -> Option<(u32, u32, u32)> {
+        let v = v.trim_start_matches('v');
+        let mut parts = v.splitn(3, '.');
 
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.split('-').next()?.parse().ok()?;
 
-    let request = format!(
-        "GET /imrany/{}/releases/latest HTTP/1.1\r\n\
-         Host: github.com\r\n\
-         User-Agent: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_NAME")
-    );
-
-    if stream.write_all(request.as_bytes()).is_err() {
-        return None;
+        Some((major, minor, patch))
     }
 
-    let reader = BufReader::new(stream);
-    for line in reader.lines().take(30).flatten() {
-        if line.to_ascii_lowercase().starts_with("location:") {
-            if let Some(tag) = line.rsplit('/').next() {
-                if tag.trim().starts_with('v') {
-                    return Some(tag.trim().to_string());
-                }
-            }
-        }
+    match (parse(latest), parse(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
     }
-    None
 }
 
 fn device_row(
@@ -1098,7 +1067,7 @@ impl Default for App {
             dark_mode: initial_dark_mode,
             scan_pulse: 0.0,
             show_upgrade: false,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: format!("v{}", env!("CARGO_PKG_VERSION")),
             this_hostname: hostname(),
             this_ip: local_ip(),
             save_dir: prefs.save_dir.clone().unwrap_or_else(|| {
@@ -1549,17 +1518,14 @@ impl App {
         self.selected.is_some()
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
         // ── Tray events ───────────────────────────────────────────────────
         if let Some(ref tray) = self.tray {
             while let Some(event) = tray.try_recv() {
                 match event {
                     tray::TrayEvent::ShowWindow => {
-                        // eframe doesn't expose show/hide directly; setting
-                        // the tab to Scan and requesting a repaint is enough
-                        // for a windowed app.  For true minimize-to-tray you
-                        // need the viewport commands below (eframe ≥ 0.28).
-                        self.tab = Tab::Scan;
+                        self.window_visible = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     }
                     tray::TrayEvent::Quit => {
                         std::process::exit(0);
@@ -2381,22 +2347,42 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle window close request
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Hide the window instead of closing when tray is active
-            if self.tray.is_some() {
+            if self.minimize_to_tray {
+                // Hide window instead of closing
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.window_visible = false;
+
+                return; // Don't process further
+            } else {
+                // Actually quit the app
+                std::process::exit(0);
             }
         }
 
         // Handle tray events
-        if let Some(ref tray) = self.tray {
+        if let Some(tray) = &self.tray {
             while let Some(event) = tray.try_recv() {
                 match event {
                     TrayEvent::ShowWindow => {
+                        println!("Tray: Show window");
                         self.window_visible = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+
+                        // On Windows, also restore from taskbar
+                        #[cfg(target_os = "windows")]
+                        {
+                            use winapi::um::winuser::{ShowWindow, SW_RESTORE};
+                            if let Some(window) = frame.window().window() {
+                                let hwnd = window.hwnd();
+                                unsafe {
+                                    ShowWindow(hwnd, SW_RESTORE);
+                                }
+                            }
+                        }
                     }
                     TrayEvent::Quit => {
+                        println!("Tray: Quit");
                         std::process::exit(0);
                     }
                 }
@@ -2445,7 +2431,7 @@ impl eframe::App for App {
             v
         });
 
-        self.poll();
+        self.poll(ctx);
         self.check_for_update();
         let scanning = self.scan_state == ScanState::Scanning;
         if scanning {
@@ -2704,7 +2690,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(
-                        RichText::new(format!("{} v{}", env!("CARGO_PKG_NAME"), self.version))
+                        RichText::new(format!("{} {}", env!("CARGO_PKG_NAME"), self.version))
                             .size(10.5).color(p.text_faint),
                     );
 
@@ -4406,7 +4392,7 @@ impl App {
             ui.add_space(10.0);
             ui.label(RichText::new(env!("CARGO_PKG_NAME").to_string()).strong().size(18.0).color(p.text));
             ui.label(
-                RichText::new(format!("v{}", self.version.clone()))
+                RichText::new(format!("{}", self.version.clone()))
                     .size(12.0)
                     .color(p.text_dim),
             );
@@ -4451,18 +4437,6 @@ impl App {
     }
 }
 
-fn is_newer(latest: &str, current: &str) -> bool {
-    fn parse(v: &str) -> Option<(u32, u32, u32)> {
-        let v = v.trim_start_matches('v');
-        let mut p = v.splitn(3, '.');
-        Some((
-            p.next()?.parse().ok()?,
-            p.next()?.parse().ok()?,
-            p.next()?.split('-').next()?.parse().ok()?
-        ))
-    }
-    matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
-}
 
 fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
     let file_exists = entry.file_exists();

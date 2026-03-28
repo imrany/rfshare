@@ -33,6 +33,7 @@ sha2         = "0.10"
 tray-icon    = "0.15"
 image        = "0.25"   # used by tray.rs to load the PNG icon
 crossbeam-channel = "0.5.15"
+minreq = { version = "2.14.1", features = ["https"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.56.0"
