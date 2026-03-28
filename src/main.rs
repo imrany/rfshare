@@ -354,14 +354,20 @@ fn fetch_latest_version() -> Option<String> {
         env!("CARGO_PKG_NAME")
     );
 
+    let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
     match minreq::get(url)
         .with_timeout(5)
-        .with_header("User-Agent", format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+        .with_header("User-Agent", user_agent)
         .send()
     {
         Ok(response) => {
             if response.status_code == 200 {
-                parse_version_from_json(response.as_str().ok()?)
+                if let Ok(body) = response.as_str() {
+                    parse_version_from_json(body)
+                } else {
+                    None
+                }
             } else {
                 eprintln!("GitHub API returned status: {}", response.status_code);
                 None
@@ -2344,7 +2350,7 @@ impl App {
 
 // ─── eframe::App ─────────────────────────────────────────────────────────────
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle window close request
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.minimize_to_tray {
@@ -2368,21 +2374,9 @@ impl eframe::App for App {
                         println!("Tray: Show window");
                         self.window_visible = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-
-                        // On Windows, also restore from taskbar
-                        #[cfg(target_os = "windows")]
-                        {
-                            use winapi::um::winuser::{ShowWindow, SW_RESTORE};
-                            if let Some(window) = frame.window().window() {
-                                let hwnd = window.hwnd();
-                                unsafe {
-                                    ShowWindow(hwnd, SW_RESTORE);
-                                }
-                            }
-                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                     TrayEvent::Quit => {
-                        println!("Tray: Quit");
                         std::process::exit(0);
                     }
                 }
