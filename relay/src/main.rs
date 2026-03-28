@@ -1,6 +1,6 @@
 // Run: cargo run --release -- 0.0.0.0:9000
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write, ErrorKind};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -80,6 +80,8 @@ fn pipe(
                 Err(e) => warn!("PIPE_ERR  code={}  dir=sender->receiver  err={}", code2, e),
             }
             let _ = b2.shutdown(std::net::Shutdown::Write);
+            // Drop original streams to close cleanly
+            drop(a);
         });
     }
 
@@ -102,11 +104,10 @@ fn pipe(
                 }
             }
             let _ = a2.shutdown(std::net::Shutdown::Write);
+            // Drop original streams to close cleanly
+            drop(b);
         });
     }
-    // Drop original streams to close cleanly
-    drop(a);
-    drop(b);
 }
 
 fn handle_http_request(mut stream: TcpStream, peer: &str) -> Option<String> {
@@ -330,7 +331,7 @@ fn main() {
             let expired_codes: Vec<String>;
             {
                 let mut map = w.lock().unwrap();
-                let before = map.len();
+                let _before = map.len();
                 let keys: Vec<String> = map.keys().cloned().collect();
                 expired_codes = keys.into_iter()
                     .filter(|code| {
