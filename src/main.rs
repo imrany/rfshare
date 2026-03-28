@@ -2344,7 +2344,7 @@ impl App {
 
 // ─── eframe::App ─────────────────────────────────────────────────────────────
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Handle window close request
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.minimize_to_tray {
