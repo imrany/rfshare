@@ -1,6 +1,6 @@
 # RFSHARE
 
-**rfshare** is a modern, encrypted peer-to-peer file sharing application built with Rust and the egui framework. It enables fast, secure file transfers between devices on the same network or across the internet using a relay server.
+**rfshare** is a modern, encrypted peer-to-peer file sharing application built with Rust and the egui framework. It enables fast, secure file transfers between devices on the same network or across the internet using a relay server. The app runs in the background with system tray support, like Telegram Desktop.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
@@ -17,6 +17,7 @@
 - **🎨 Modern UI** - Clean interface with dark/light theme support
 - **🖱️ Drag & Drop** - Simply drag files into the app to add them to the queue
 - **📱 Cross-Platform** - Works on Windows, macOS, and Linux
+- **🖥️ System Tray Support** - Minimize to system tray and continue running in background
 
 ### Technical Highlights
 - **Resumable Transfers** - Interrupted transfers can be resumed from where they stopped
@@ -25,32 +26,33 @@
 - **Smart Sync** - Only syncs files that have changed (uses modification timestamps)
 - **Network Monitoring** - Automatically detects IP changes and reconnects
 - **No Cloud Storage** - Files never leave your devices or relay server (relay only pipes encrypted data)
+- **System Tray Integration** - App stays alive in background when window is closed
 
 ## 📸 Demonstration
 
 <table>
-  <tr>
+   <tr>
     <td align="center"><b>1. Scanning for devices</b></td>
     <td align="center"><b>2. Sending a file</b></td>
-  </tr>
-  <tr>
+   </tr>
+   <tr>
     <td align="center"><img src="./assets/rfshare_scan.png" alt="Scan Image" width="400" height="500"/></td>
     <td align="center"><img src="./assets/rfshare_send.png" alt="Send Image" width="400" height="500"/></td>
-  </tr>
-  <tr>
+   </tr>
+   <tr>
     <td align="center"><b>3. Receiving a file</b></td>
     <td align="center"><b>4. History tab</b></td>
-  </tr>
-  <tr>
+   </tr>
+   <tr>
     <td align="center"><img src="./assets/rfshare_receive.png" alt="Received Image" width="400" height="500"/></td>
     <td align="center"><img src="./assets/rfshare_received_tab.png" alt="History Tab Image" width="400" height="500"/></td>
-  </tr>
-  <tr>
-    <td align="center" colspan="2"><b>5. Sync a folder (Pro feature)</b></td>
-  </tr>
-  <tr>
-    <td align="center" colspan="2"><img src="./assets/rfshare_sync.png" alt="Sync Image" width="400" height="500"/></td>
-  </tr>
+   </tr>
+   <tr>
+    <td align="center"><b>5. Sync a folder (Pro feature)</b></td>
+   </tr>
+   <tr>
+    <td align="center"><img src="./assets/rfshare_sync.png" alt="Sync Image" width="400" height="500"/></td>
+   </tr>
 </table>
 
 ## 🚀 Quick Start
@@ -64,6 +66,16 @@ curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install
 
 Installs the `.deb` package on Debian/Ubuntu (includes desktop entry and icon).  
 Falls back to a bare binary on other distros.
+
+> **Note for GNOME users**: Tray icons are hidden by default. Install the AppIndicator extension:
+ ```bash
+
+sudo apt install gnome-shell-extension-manager
+sudo apt install gnome-shell-extension-appindicator
+ # Then enable it via Extension Manager or gnome-extensions
+## extension-manager
+# gnome-extensions list
+```
 
 > **User-only install (no sudo):**
 > ```bash
@@ -92,12 +104,12 @@ Adds rfshare to your PATH, creates a Start Menu shortcut, and registers it in Ad
 
 **Linux / macOS**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash -s -- --version v0.14.0
+curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash -s -- --version v0.15.0
 ```
 
 **Windows**
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.ps1))) -Version v0.14.0
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.ps1))) -Version v0.15.0
 ```
 
 ### Uninstall
@@ -142,11 +154,17 @@ Each file has a matching `.sha256` checksum.
    - Desktop notifications appear when transfers complete
    - View received files in the **History** tab
 
-4. **Remote sharing (Pro)**:
+4. **System Tray** (Optional):
+   - Click the close button (X) to minimize to tray
+   - The app continues running in background
+   - Right-click the tray icon to show/hide the window or quit
+   - Configure in **Settings** → **Preferences** → **System Tray**
+
+5. **Remote sharing (Pro)**:
    - **Receiver**: Click **Scan** → **Remote** → **Go Online** → Share the code
    - **Sender**: Click **Scan** → **Remote** → Enter code → **Connect** → Send files
 
-5. **Folder sync (Pro)**:
+6. **Folder sync (Pro)**:
    - Select a device
    - Go to **Sync** tab
    - Click **Set folder to watch**
@@ -194,6 +212,7 @@ Each file has a matching `.sha256` checksum.
 | Transfer History | ✅ | ✅ |
 | Drag & Drop | ✅ | ✅ |
 | Desktop Notifications | ✅ | ✅ |
+| System Tray Support | ✅ | ✅ |
 | **Remote Transfer** | ❌ | ✅ |
 | **Folder Sync** | ❌ | ✅ |
 | **Remote Folder Sync** | ❌ | ✅ |
@@ -225,6 +244,15 @@ Support development and get Pro features:
 ### Prerequisites
 - Rust 1.70 or later
 - Cargo package manager
+- **Linux**: GTK development libraries (for system tray)
+  ```bash
+  # Ubuntu/Debian
+  sudo apt install libgtk-3-dev
+  # Fedora
+  sudo dnf install gtk3-devel
+  # Arch
+  sudo pacman -S gtk3
+  ```
 
 ### Build
 ```bash
@@ -266,6 +294,15 @@ cargo build --release
 - **Per-Connection Keys** - Unique keys for each transfer
 - **No Key Reuse** - Fresh keys for every session
 
+## 🎯 Use Cases
+
+1. **Home Network Sharing** - Share files between computers on same Wi-Fi
+2. **Remote Work** - Send files to colleagues across the internet
+3. **Backup Sync** - Automatically sync folders to another computer
+4. **Quick File Transfer** - Fast, no-server transfers between devices
+5. **Secure Sharing** - Encrypted transfers for sensitive files
+6. **Background Operations** - Keep app running in tray while working
+
 ## 🐛 Troubleshooting
 
 ### Common Issues
@@ -289,6 +326,16 @@ cargo build --release
 - **Windows**: Start Menu → rfshare
 - **macOS**: Applications folder → rfshare.app
 - **Linux**: Run `rfshare` in terminal or find in application menu
+
+**Q: Tray icon doesn't appear on Linux/GNOME**
+- GNOME hides tray icons by default
+- Install and enable the AppIndicator extension:
+  ```bash
+  sudo apt install gnome-shell-extension-appindicator
+  gnome-extensions enable ubuntu-appindicators@ubuntu.com
+  # Restart GNOME Shell (Alt+F2 → r)
+  ```
+- For other desktop environments, tray icons work out of the box
 
 **Q: Folder sync isn't working**
 - Ensure you have a Pro license activated
@@ -330,10 +377,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [RustCrypto](https://github.com/RustCrypto) - Cryptographic implementations
 - [x25519-dalek](https://github.com/dalek-cryptography/x25519-dalek) - X25519 implementation
 - [egui_material_icons](https://crates.io/crates/egui_material_icons) - Material Design icons
+- [tray-icon](https://crates.io/crates/tray-icon) - Cross-platform system tray support
 
 ## 📞 Support
 
 - **Issues**: [GitHub Issues](https://github.com/imrany/rfshare/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/imrany/rfshare/discussions)
-
-**rfshare** - Fast, secure, and simple file sharing for everyone.

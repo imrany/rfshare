@@ -1,13 +1,13 @@
 [package]
-name = "rfshare"
-version = "0.14.0"
-edition = "2024"
+name        = "rfshare"
+version     = "0.15.0"
+edition     = "2024"
 authors     = ["Imrany <imranmat254@gmail.com>"]
 description = "Fast, encrypted file transfers"
 homepage    = "https://rfshare.imrany.dev"
 repository  = "https://github.com/imrany/rfshare"
 license     = "MIT"
-keywords    = ["file-transfer", "lan", "network", "encryption", "egui", "remote"]
+keywords    = ["file-transfer", "lan", "network", "encryption", "egui"]
 categories  = ["network-programming", "gui"]
 readme      = "README.md"
 
@@ -16,42 +16,48 @@ name = "rfshare"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.33", features = ["default"] }
-egui   = "0.33"
-dirs   = "5"
-rfd    = "0.15"   # native file-picker dialog
-egui_extras = { version = "0.33.3", features = ["image"] }
+eframe       = { version = "0.33", features = ["default"] }
+egui         = "0.33"
+egui_extras  = { version = "0.33", features = ["image"] }
 egui_material_icons = "0.5.0"
+dirs         = "5"
+rfd          = "0.15"
+
 # Crypto — end-to-end encryption
-x25519-dalek = { version = "2", features = ["static_secrets"] }   # ECDH key exchange (X25519)
-aes-gcm      = "0.10"                                              # AES-256-GCM authenticated encryption
-rand         = "0.8"                                               # CSPRNG for nonce generation
-sha2         = "0.10"                                              # SHA-256 for KDF
-minreq = { version = "2.14.1", features = ["https"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm      = "0.10"
+rand         = "0.8"
+sha2         = "0.10"
 
-# Windows-specific runtime dependencies
+# System tray
+tray-icon    = "0.15"
+image        = "0.25"   # used by tray.rs to load the PNG icon
+crossbeam-channel = "0.5.15"
+
 [target.'cfg(target_os = "windows")'.dependencies]
-winreg = "0.56.0"  # Moved from build-dependencies to dependencies
+winreg = "0.56.0"
 
-# Windows: embed icon + version info into the .exe (build-time only)
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+# Windows: embed icon + version info into the .exe
 [target.'cfg(target_os = "windows")'.build-dependencies]
-winresource = "0.1"  # Remove winreg from here
+winresource = "0.1"
 
 [profile.release]
-opt-level = 3
-lto       = true
-strip     = true
+opt-level     = 3
+lto           = true
+strip         = true
 codegen-units = 1
-panic = "abort"
+panic         = "abort"
 
 [profile.dev]
 opt-level = 1
 
-# cargo-bundle metadata
 [package.metadata.bundle]
 name              = "rfshare"
 identifier        = "dev.rfshare.app"
-version           = "0.14.0"
+version           = "0.15.0"
 copyright         = "Copyright © 2026 Imrany"
 category          = "Utility"
 short_description = "Fast, encrypted file transfers"
@@ -60,9 +66,7 @@ icon              = ["assets/icon.png", "assets/icon.ico"]
 
 [package.metadata.bundle.linux]
 exec       = "rfshare"
-categories = ["Network", "FileTransfer", "Utility", "RemoteAccess"]
+categories = ["Network", "FileTransfer", "Utility"]
 
 [workspace]
-members = [
-    "relay",
-]
+members = ["relay"]

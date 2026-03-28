@@ -18,6 +18,9 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
+mod tray;
+use tray::{TrayEvent, TrayManager};
+
 const DISCOVER_PORT: u16 = 44444;
 const TRANSFER_PORT: u16 = 44445;
 const DISCOVER_MSG: &[u8] = b"RFSHARE_DISCOVER";
@@ -1026,6 +1029,10 @@ pub struct App {
     relay_sync_rx: Option<std::sync::mpsc::Receiver<SyncMsg>>,
     relay_sync_log: Vec<String>,
     auto_detect_theme: bool,
+
+    minimize_to_tray: bool,
+    window_visible: bool,
+    tray: Option<TrayManager>,
 }
 
 enum RelayMsg {
@@ -1045,6 +1052,10 @@ impl Default for App {
         } else {
             prefs.dark_mode.unwrap_or(true)
         };
+
+        // Setup tray
+        let tray = TrayManager::new(env!("CARGO_PKG_NAME")).ok();
+
         let (network_monitor, network_monitor_sender) = NetworkMonitor::new();
         let recv_state = Arc::new(Mutex::new(RecvState::default()));
         let save_dir = prefs.save_dir.clone().unwrap_or_else(|| {
@@ -1126,6 +1137,9 @@ impl Default for App {
             relay_sync_jobs: Vec::new(),
             relay_sync_rx: None,
             relay_sync_log: Vec::new(),
+            minimize_to_tray: true,  // Default to minimize to tray
+            window_visible: true,     // Window starts visible
+            tray,
         }
     }
 }
@@ -1536,6 +1550,24 @@ impl App {
     }
 
     fn poll(&mut self) {
+        // ── Tray events ───────────────────────────────────────────────────
+        if let Some(ref tray) = self.tray {
+            while let Some(event) = tray.try_recv() {
+                match event {
+                    tray::TrayEvent::ShowWindow => {
+                        // eframe doesn't expose show/hide directly; setting
+                        // the tab to Scan and requesting a repaint is enough
+                        // for a windowed app.  For true minimize-to-tray you
+                        // need the viewport commands below (eframe ≥ 0.28).
+                        self.tab = Tab::Scan;
+                    }
+                    tray::TrayEvent::Quit => {
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
+
         // Use try_lock instead of lock to avoid blocking
         if let Ok(mut recv_state) = self.recv_state.try_lock() {
             // Process received files
@@ -1951,6 +1983,109 @@ impl App {
                     ui.label(RichText::new(format!("System theme: {}", if detect_system_theme() { "Dark" } else { "Light" }))
                         .size(10.5).color(p.text_faint));
                 }
+
+            });
+
+        ui.add_space(20.0);
+
+        // ── Tray Settings ────────────────────────────────────────────────────
+        ui.label(RichText::new("System Tray").strong().size(13.0).color(p.text_dim));
+        ui.add_space(8.0);
+
+        egui::Frame::new()
+            .fill(p.surface2)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                // Platform-specific behavior
+                #[cfg(target_os = "macos")]
+                {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Window close behavior")
+                                .size(12.0)
+                                .color(p.text));
+                            ui.label(RichText::new("macOS typically quits apps when the last window closes")
+                                .size(10.5)
+                                .color(p.text_faint));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if toggle_switch(ui, &p, self.minimize_to_tray).clicked() {
+                                self.minimize_to_tray = !self.minimize_to_tray;
+                                self.persist_prefs();
+                            }
+                        });
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    let behavior_text = if self.minimize_to_tray {
+                        "App will minimize to tray when window is closed"
+                    } else {
+                        "App will quit when window is closed"
+                    };
+                    ui.label(
+                        RichText::new(behavior_text)
+                            .size(11.0)
+                            .color(p.text_dim)
+                    );
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // Minimize to tray option (standard behavior)
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Minimize to system tray")
+                                .size(12.0)
+                                .color(p.text));
+                            ui.label(RichText::new("Keep app running in background when window is closed")
+                                .size(10.5)
+                                .color(p.text_faint));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if toggle_switch(ui, &p, self.minimize_to_tray).clicked() {
+                                self.minimize_to_tray = !self.minimize_to_tray;
+                                self.persist_prefs();
+                            }
+                        });
+                    });
+                }
+
+                ui.add_space(12.0);
+
+                // Platform-specific tips
+                #[cfg(target_os = "windows")]
+                {
+                    ui.label(
+                        RichText::new("💡 Tip: When minimized, the app stays in the system tray (notification area). Click the tray icon to restore the window.")
+                            .size(10.0)
+                            .color(p.text_faint)
+                    );
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    ui.label(
+                        RichText::new("💡 Tip: When minimized to tray, the app stays in the menu bar. Click the icon to restore the window.")
+                            .size(10.0)
+                            .color(p.text_faint)
+                    );
+                }
+
+                #[cfg(target_os = "linux")]
+                {
+                    ui.label(
+                        RichText::new("💡 Tip: When minimized, the app stays in the system tray. If you don't see the icon, you may need a GNOME extension like 'AppIndicator'.")
+                            .size(10.0)
+                            .color(p.text_faint)
+                    );
+                }
             });
     }
 
@@ -2244,6 +2379,30 @@ impl App {
 // ─── eframe::App ─────────────────────────────────────────────────────────────
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle window close request
+        if ctx.input(|i| i.viewport().close_requested()) {
+            // Hide the window instead of closing when tray is active
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+
+        // Handle tray events
+        if let Some(ref tray) = self.tray {
+            while let Some(event) = tray.try_recv() {
+                match event {
+                    TrayEvent::ShowWindow => {
+                        self.window_visible = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    }
+                    TrayEvent::Quit => {
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
+
         // Request repaint only when needed - not every frame
         let needs_repaint = self.scan_state == ScanState::Scanning
             || self.any_active()
@@ -5651,8 +5810,16 @@ fn detect_system_theme() -> bool {
     }
 }
 
-// ─── main ─────────────────────────────────────────────────────────────────────
 fn main() -> eframe::Result<()> {
+    // Initialize GTK on Linux for system tray support
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = gtk::init() {
+            eprintln!("Warning: Failed to initialize GTK: {}", e);
+            eprintln!("System tray may not work properly");
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("{}", env!("CARGO_PKG_NAME")))
@@ -5673,6 +5840,7 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             egui_material_icons::initialize(&cc.egui_ctx);
+
             Ok(Box::new(App::default()))
         }),
     )

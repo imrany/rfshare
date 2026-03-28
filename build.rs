@@ -11,8 +11,8 @@ fn main() {
         res.set("FileDescription", "Fast, encrypted file transfers");
         res.set("CompanyName", "Imrany");
         res.set("LegalCopyright", "Copyright © 2026 Imrany");
-        res.set("ProductVersion", "0.14.0");
-        res.set("FileVersion", "0.14.0");
+        res.set("ProductVersion", "0.15.0");
+        res.set("FileVersion", "0.15.0");
 
         // Request the lowest privilege level — prevents UAC elevation prompts.
         // The app only uses local network sockets; it needs no admin rights.
