@@ -22,6 +22,24 @@ On the receiving side, the file arrives, gets saved to the Downloads folder (wit
 
 **What it does not do:** it does not use the internet, it does not compress or encrypt the transfer, it does not support sending to multiple devices at once, and it does not resume interrupted transfers. It is intentionally simple — point, pick, send.
 
+## What works
+
+- ✅ Local network file sharing
+
+- ✅ Remote file sharing via relay server
+
+- ✅ Folder sync for both local and remote
+
+- ✅ Transfer history with remote/local tracking
+
+- ✅ System theme detection
+
+- ✅ Cross-platform support (Windows, Mac, Linux)
+
+- ✅ End-to-end encryption
+
+- ✅ Resume capability for interrupted transfers
+
 ## Demonstration
 
 <table>

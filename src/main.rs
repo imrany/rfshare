@@ -239,6 +239,8 @@ fn save_prefs(
     notify_on_receive: bool,
     auto_open_folder: bool,
     manual_peers: &[(String,String)],
+    auto_detect_theme: bool,
+    dark_mode: Option<bool>,
 ) {
     let Some(path) = prefs_path() else { return };
     if let Some(parent) = path.parent() {
@@ -261,9 +263,13 @@ fn save_prefs(
     }
     out.push_str(&format!("notify_on_receive={}\n", notify_on_receive as u8));
     out.push_str(&format!("auto_open_folder={}\n", auto_open_folder as u8));
+    // Add auto_detect_theme and dark_mode
+    out.push_str(&format!("auto_detect_theme={}\n", auto_detect_theme as u8));
+    if let Some(dark) = dark_mode {
+        out.push_str(&format!("dark_mode={}\n", dark as u8));
+    }
     let _ = fs::write(&path, out);
 }
-
 #[derive(Default)]
 struct SavedPrefs {
     peer_name: String,
@@ -274,6 +280,8 @@ struct SavedPrefs {
     notify_on_receive: bool,
     auto_open_folder: bool,
     manual_peers: Vec<(String, String)>,  // (name, addr_str)
+    auto_detect_theme: bool,  // Whether to auto-detect system theme
+    dark_mode: Option<bool>,   // User's manual theme choice (if auto-detect is off)
 }
 
 fn load_prefs() -> SavedPrefs {
@@ -296,6 +304,8 @@ fn load_prefs() -> SavedPrefs {
         if let Some(v) = line.strip_prefix("save_dir=")           { prefs.save_dir = Some(PathBuf::from(v)); }
         if let Some(v) = line.strip_prefix("notify_on_receive=")  { prefs.notify_on_receive = v == "1"; }
         if let Some(v) = line.strip_prefix("auto_open_folder=")   { prefs.auto_open_folder  = v == "1"; }
+        if let Some(v) = line.strip_prefix("auto_detect_theme=") { prefs.auto_detect_theme = v == "1"; }
+        if let Some(v) = line.strip_prefix("dark_mode=") { prefs.dark_mode = Some(v == "1"); }
         if let Some(rest) = line.strip_prefix("manual_peer_") {
             if let Some(idx_end) = rest.find('_') {
                 if let Ok(idx) = rest[..idx_end].parse::<usize>() {
@@ -584,6 +594,12 @@ impl Pal {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum TransferType {
+    Local,
+    Remote,
+}
+
 // ─── History ─────────────────────────────────────────────────────────────────
 #[derive(Clone, Debug)]
 struct HistoryEntry {
@@ -594,6 +610,7 @@ struct HistoryEntry {
     peer_name: String,
     success: bool,
     error: Option<String>,
+    transfer_type: TransferType,
     file_path: Option<PathBuf>,
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -629,6 +646,7 @@ impl HistoryEntry {
 fn history_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join(env!("CARGO_PKG_NAME")).join("history.csv"))
 }
+
 fn load_history() -> Vec<HistoryEntry> {
     let Some(path) = history_path() else {
         return Vec::new();
@@ -638,8 +656,8 @@ fn load_history() -> Vec<HistoryEntry> {
     };
     let mut out = Vec::new();
     for line in text.lines().skip(1) {
-        let cols: Vec<&str> = line.splitn(8, ',').collect();
-        if cols.len() < 7 {
+        let cols: Vec<&str> = line.splitn(9, ',').collect();
+        if cols.len() < 8 {
             continue;
         }
         let ts = cols[0].parse::<u64>().unwrap_or(0);
@@ -648,22 +666,34 @@ fn load_history() -> Vec<HistoryEntry> {
         } else {
             TransferDir::Received
         };
-        let name = cols[2].to_string();
-        let size = cols[3].parse::<u64>().unwrap_or(0);
-        let peer = cols[4].to_string();
-        let ok = cols[5] == "1";
-        let err = if cols[6].is_empty() {
-            None
+        // Handle both old and new format (with type field)
+        let trans_type = if cols.len() >= 3 {
+            if cols[2] == "remote" {
+                TransferType::Remote
+            } else {
+                TransferType::Local
+            }
         } else {
-            Some(cols[6].to_string())
+            TransferType::Local // Default for old entries
         };
-        let fpath = cols
-            .get(7)
+
+        let name = if cols.len() >= 4 { cols[3].to_string() } else { cols[2].to_string() };
+        let size = if cols.len() >= 5 { cols[4].parse::<u64>().unwrap_or(0) } else { cols[3].parse::<u64>().unwrap_or(0) };
+        let peer = if cols.len() >= 6 { cols[5].to_string() } else { cols[4].to_string() };
+        let ok = if cols.len() >= 7 { cols[6] == "1" } else { cols[5] == "1" };
+        let err = if cols.len() >= 8 {
+            if cols[7].is_empty() { None } else { Some(cols[7].to_string()) }
+        } else {
+            if cols[6].is_empty() { None } else { Some(cols[6].to_string()) }
+        };
+        let fpath = cols.get(8)
             .filter(|s| !s.is_empty())
             .map(|s| PathBuf::from(s));
+
         out.push(HistoryEntry {
             timestamp: ts,
             direction: dir,
+            transfer_type: trans_type,
             file_name: name,
             file_size: size,
             peer_name: peer,
@@ -675,6 +705,7 @@ fn load_history() -> Vec<HistoryEntry> {
     out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     out
 }
+
 fn append_history(entry: &HistoryEntry) {
     let Some(path) = history_path() else { return };
     if let Some(parent) = path.parent() {
@@ -683,12 +714,17 @@ fn append_history(entry: &HistoryEntry) {
     let needs_header = !path.exists();
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         if needs_header {
-            let _ = writeln!(f, "timestamp,direction,name,size,peer,ok,error,file_path");
+            let _ = writeln!(f, "timestamp,direction,type,name,size,peer,ok,error,file_path");
         }
         let dir = if entry.direction == TransferDir::Sent {
             "sent"
         } else {
             "received"
+        };
+        let trans_type = if entry.transfer_type == TransferType::Local {
+            "local"
+        } else {
+            "remote"
         };
         let err = entry.error.as_deref().unwrap_or("").replace(',', ";");
         let fpath = entry
@@ -700,8 +736,8 @@ fn append_history(entry: &HistoryEntry) {
         let ok = if entry.success { 1 } else { 0 };
         let _ = writeln!(
             f,
-            "{},{},{},{},{},{},{},{}",
-            entry.timestamp, dir, entry.file_name, entry.file_size, entry.peer_name, ok, err, fpath
+            "{},{},{},{},{},{},{},{},{}",
+            entry.timestamp, dir, trans_type, entry.file_name, entry.file_size, entry.peer_name, ok, err, fpath
         );
     }
 }
@@ -917,6 +953,12 @@ pub struct App {
     last_internet_check: std::time::Instant,
     relay_stream: Option<Arc<Mutex<Option<TcpStream>>>>,
     is_relay_mode: bool,
+    relay_sync_map: std::collections::HashMap<String, PathBuf>,  // key = peer_addr string
+    relay_sync_active: bool,
+    relay_sync_jobs: Vec<SyncJob>,
+    relay_sync_rx: Option<std::sync::mpsc::Receiver<SyncMsg>>,
+    relay_sync_log: Vec<String>,
+    auto_detect_theme: bool,
 }
 
 enum RelayMsg {
@@ -929,6 +971,13 @@ enum RelayMsg {
 impl Default for App {
     fn default() -> Self {
         let prefs = load_prefs();
+        // Determine initial theme
+        let initial_auto_detect = prefs.auto_detect_theme;
+        let initial_dark_mode = if initial_auto_detect {
+            detect_system_theme()
+        } else {
+            prefs.dark_mode.unwrap_or(true)
+        };
         let (network_monitor, network_monitor_sender) = NetworkMonitor::new();
         let recv_state = Arc::new(Mutex::new(RecvState::default()));
         let save_dir = prefs.save_dir.clone().unwrap_or_else(|| {
@@ -967,7 +1016,8 @@ impl Default for App {
             license_msg: None,
             settings_tab: SettingsTab::Device,
             tab: Tab::Scan,
-            dark_mode: true,
+            auto_detect_theme: initial_auto_detect,
+            dark_mode: initial_dark_mode,
             scan_pulse: 0.0,
             show_upgrade: false,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1004,6 +1054,11 @@ impl Default for App {
             last_internet_check: std::time::Instant::now(),
             relay_stream: None,
             is_relay_mode: false,
+            relay_sync_map: std::collections::HashMap::new(),
+            relay_sync_active: false,
+            relay_sync_jobs: Vec::new(),
+            relay_sync_rx: None,
+            relay_sync_log: Vec::new(),
         }
     }
 }
@@ -1052,9 +1107,17 @@ impl App {
         let manual: Vec<(String, String)> = self.manual_peers.iter()
             .map(|p| (p.name.clone(), p.addr.to_string()))
             .collect();
-        save_prefs(name, &addr, &self.sync_map,
+
+        // Create a combined sync map (local + remote)
+        let mut all_sync = self.sync_map.clone();
+        all_sync.extend(self.relay_sync_map.clone());
+
+        save_prefs(name, &addr, &all_sync,
             Some(&self.save_dir), self.notify_on_receive,
-            self.auto_open_folder, &manual);
+            self.auto_open_folder, &manual,
+            self.auto_detect_theme,
+            Some(self.dark_mode),
+        );
     }
 
     fn start_scan(&mut self) {
@@ -1134,7 +1197,7 @@ impl App {
         // Check if we're in relay mode
         let use_relay = self.is_relay_mode && self.relay_stream.is_some();
 
-        // Take the relay stream if in relay mode
+        // Take the relay stream if in relay mode (only once)
         let relay_stream_opt = if use_relay {
             if let Some(stream_arc) = &self.relay_stream {
                 if let Ok(mut guard) = stream_arc.lock() {
@@ -1168,6 +1231,17 @@ impl App {
         let peer_name = peer.name.clone();
         let use_relay_clone = use_relay;
 
+        // Move relay_stream_opt into the thread - but need to handle multiple files
+        // Since we have multiple files, we need to wrap the stream in Arc<Mutex> to share it
+        // But we already took it from self.relay_stream, so we need to rewrap it
+
+        // For multiple files, we need to wrap the stream in Arc<Mutex> to share
+        let shared_stream = if let Some(stream) = relay_stream_opt {
+            Some(Arc::new(Mutex::new(Some(stream))))
+        } else {
+            None
+        };
+
         thread::spawn(move || {
             for (index, path, name, size) in items {
                 let tx2 = tx.clone();
@@ -1175,10 +1249,18 @@ impl App {
                 let nm = name.clone();
 
                 let result = if use_relay_clone {
-                    if let Some(mut stream) = relay_stream_opt {
-                        send_file_via_relay(&path, &name, size, &mut stream, move |p| {
-                            let _ = tx2.send(QueueMsg::Progress { index, progress: p });
-                        })
+                    if let Some(stream_arc) = &shared_stream {
+                        if let Ok(mut guard) = stream_arc.lock() {
+                            if let Some(mut stream) = guard.take() {
+                                send_file_via_relay(&path, &name, size, &mut stream, move |p| {
+                                    let _ = tx2.send(QueueMsg::Progress { index, progress: p });
+                                })
+                            } else {
+                                Err("No relay stream available".into())
+                            }
+                        } else {
+                            Err("Failed to lock relay stream".into())
+                        }
                     } else {
                         Err("No relay stream available".into())
                     }
@@ -1199,6 +1281,7 @@ impl App {
                         append_history(&HistoryEntry {
                             timestamp: ts,
                             direction: TransferDir::Sent,
+                            transfer_type: TransferType::Local,
                             file_name: nm,
                             file_size: size,
                             peer_name: pn,
@@ -1212,6 +1295,7 @@ impl App {
                         append_history(&HistoryEntry {
                             timestamp: ts,
                             direction: TransferDir::Sent,
+                            transfer_type: TransferType::Local,
                             file_name: nm,
                             file_size: size,
                             peer_name: pn,
@@ -1569,6 +1653,37 @@ impl App {
             }
         }
 
+        // Process relay sync messages with non-blocking
+        if let Some(rx) = &self.relay_sync_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    SyncMsg::FileFound { name } => {
+                        self.relay_sync_log.push(format!("... sending via relay {}", name));
+                        if self.relay_sync_log.len() > 100 {
+                            self.relay_sync_log.drain(0..50);
+                        }
+                    }
+                    SyncMsg::FileSent { name, .. } => {
+                        self.relay_sync_log.retain(|l| !l.contains(&format!("... sending via relay {}", name)));
+                        self.relay_sync_log.push(format!("OK via relay: {}", name));
+                        if self.relay_sync_log.len() > 100 {
+                            self.relay_sync_log.drain(0..50);
+                        }
+                    }
+                    SyncMsg::FileError { name, error } => {
+                        self.relay_sync_log.retain(|l| !l.contains(&format!("... sending via relay {}", name)));
+                        self.relay_sync_log.push(format!("ERR via relay {} — {}", name, error));
+                        if self.relay_sync_log.len() > 100 {
+                            self.relay_sync_log.drain(0..50);
+                        }
+                    }
+                    SyncMsg::FileSkipped { name } => {
+                        self.relay_sync_log.retain(|l| !l.contains(&format!("... sending via relay {}", name)));
+                    }
+                }
+            }
+        }
+
         // Network change detection - safe version without static mut
         thread_local! {
             static LAST_NETWORK_CHECK: std::cell::RefCell<std::time::Instant> =
@@ -1715,26 +1830,60 @@ impl App {
             .corner_radius(10.0).inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+
+                // Auto-detect toggle
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Theme").size(12.0).color(p.text));
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Auto-detect system theme").size(12.0).color(p.text));
+                        ui.label(RichText::new("Follow your operating system theme").size(10.5).color(p.text_faint));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if toggle_switch(ui, &p, self.auto_detect_theme).clicked() {
+                            self.auto_detect_theme = !self.auto_detect_theme;
+                            if self.auto_detect_theme {
+                                self.dark_mode = detect_system_theme();
+                            }
+                            self.persist_prefs();
+                        }
+                    });
+                });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                // Manual theme toggle
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Manual theme override").size(12.0).color(p.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         for (lbl, is_dark) in [("Dark", true), ("Light", false)] {
                             let active = self.dark_mode == is_dark;
-                            let col = if active { p.accent } else { p.text_dim };
-                            let fill = if active { tint(p.accent, 22) } else { p.surface };
-                            if ui.add(egui::Button::new(
-                                RichText::new(lbl).size(12.0).color(col))
-                                .fill(fill)
-                                .stroke(Stroke::new(1.0, if active { p.accent } else { p.border }))
-                                .corner_radius(6.0)
-                                .min_size(Vec2::new(60.0, 28.0))).clicked()
-                            {
-                                self.dark_mode = is_dark;
-                            }
+                            let disabled = self.auto_detect_theme;
+                            let col = if active && !disabled { p.accent } else if disabled { p.text_faint } else { p.text_dim };
+                            let fill = if active && !disabled { tint(p.accent, 22) } else if disabled { tint(p.surface, 50) } else { p.surface };
+
+                            ui.add_enabled_ui(!disabled, |ui| {
+                                if ui.add(egui::Button::new(
+                                    RichText::new(lbl).size(12.0).color(col))
+                                    .fill(fill)
+                                    .stroke(Stroke::new(1.0, if active && !disabled { p.accent } else { p.border }))
+                                    .corner_radius(6.0)
+                                    .min_size(Vec2::new(60.0, 28.0))).clicked()
+                                {
+                                    self.dark_mode = is_dark;
+                                    self.persist_prefs();
+                                }
+                            });
                             ui.add_space(4.0);
                         }
                     });
                 });
+
+                if self.auto_detect_theme {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(format!("System theme: {}", if detect_system_theme() { "Dark" } else { "Light" }))
+                        .size(10.5).color(p.text_faint));
+                }
             });
     }
 
@@ -1817,6 +1966,7 @@ impl App {
                                 append_history(&HistoryEntry {
                                     timestamp: ts,
                                     direction: TransferDir::Received,
+                                    transfer_type: TransferType::Remote,
                                     file_name: f.name.clone(),
                                     file_size: f.size,
                                     peer_name: f.peer_name.clone(),
@@ -1842,6 +1992,184 @@ impl App {
                     });
                 }
             }
+        }
+    }
+
+    fn start_relay_sync_watcher(&mut self) {
+        if !self.is_pro() {
+            self.show_upgrade = true;
+            return;
+        }
+
+        if self.relay_sync_jobs.is_empty() || self.relay_sync_active {
+            return;
+        }
+
+        if !self.is_relay_mode || self.relay_stream.is_none() {
+            self.remote_msg = Some(("Cannot start remote sync: No active relay connection".into(), true));
+            return;
+        }
+
+        self.relay_sync_active = true;
+        let jobs = self.relay_sync_jobs.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<SyncMsg>();
+        self.relay_sync_rx = Some(rx);
+
+        // Clone the relay stream for the sync thread
+        let relay_stream_arc = self.relay_stream.clone();
+
+        thread::spawn(move || {
+            let mut job_mtimes: Vec<std::collections::HashMap<String, u64>> = jobs
+                .iter()
+                .map(|_| std::collections::HashMap::new())
+                .collect();
+
+            let mut last_scan = std::time::Instant::now();
+
+            loop {
+                // Throttle scanning to avoid CPU spikes
+                if last_scan.elapsed() < std::time::Duration::from_millis(SYNC_POLL_MS) {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                last_scan = std::time::Instant::now();
+
+                for (job_idx, job) in jobs.iter().enumerate() {
+                    let Ok(entries) = fs::read_dir(&job.folder) else {
+                        continue;
+                    };
+
+                    let mut files_to_send = Vec::new();
+
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if !path.is_file() {
+                            continue;
+                        }
+
+                        let key = path.to_string_lossy().to_string();
+                        let current_mtime = fs::metadata(&path)
+                            .and_then(|m| m.modified())
+                            .map(|t| {
+                                t.duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs()
+                            })
+                            .unwrap_or(0);
+
+                        if let Some(&last_sent_mtime) = job_mtimes[job_idx].get(&key) {
+                            if last_sent_mtime >= current_mtime {
+                                continue;
+                            }
+                        }
+
+                        let name = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+                        files_to_send.push((path, key, name, size, current_mtime));
+                    }
+
+                    // Send files via relay
+                    for (path, key, name, size, current_mtime) in files_to_send {
+                        let _ = tx.send(SyncMsg::FileFound { name: name.clone() });
+
+                        // Get a relay stream for this file transfer
+                        if let Some(stream_arc) = &relay_stream_arc {
+                            if let Ok(mut guard) = stream_arc.lock() {
+                                if let Some(mut stream) = guard.take() {
+                                    match send_file_via_relay(&path, &name, size, &mut stream, |_| {}) {
+                                        Ok(()) => {
+                                            job_mtimes[job_idx].insert(key.clone(), current_mtime);
+                                            let _ = tx.send(SyncMsg::FileSent { name, path: key });
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(SyncMsg::FileError { name, error: e });
+                                        }
+                                    }
+                                    // Put the stream back
+                                    *guard = Some(stream);
+                                } else {
+                                    let _ = tx.send(SyncMsg::FileError {
+                                        name: name.clone(),
+                                        error: "No relay stream available".into()
+                                    });
+                                }
+                            }
+                        }
+
+                        // Small delay between file sends
+                        thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+        });
+    }
+
+    fn add_relay_sync_folder(&mut self, folder: PathBuf) {
+        if !self.is_pro() {
+            self.show_upgrade = true;
+            return;
+        }
+
+        if !self.is_relay_mode {
+            self.remote_msg = Some(("Remote sync requires an active relay connection".into(), true));
+            return;
+        }
+
+        let peer = self.selected_peer().cloned();
+        if let Some(peer) = peer {
+            let addr_key = peer.addr.to_string();
+            if self.relay_sync_active {
+                self.relay_sync_rx = None;
+                self.relay_sync_active = false;
+            }
+            self.relay_sync_map.insert(addr_key, folder);
+            self.rebuild_relay_sync_jobs();
+            self.persist_prefs();
+        }
+    }
+
+    fn remove_relay_sync_folder(&mut self) {
+        if let Some(peer) = self.selected_peer().cloned() {
+            if self.relay_sync_active {
+                self.relay_sync_rx = None;
+                self.relay_sync_active = false;
+            }
+            self.relay_sync_map.remove(&peer.addr.to_string());
+            self.rebuild_relay_sync_jobs();
+            self.persist_prefs();
+        }
+    }
+
+    fn stop_relay_sync(&mut self) {
+        self.relay_sync_rx = None;
+        self.relay_sync_active = false;
+        self.relay_sync_log.push("-- Remote sync stopped".to_string());
+    }
+
+    fn rebuild_relay_sync_jobs(&mut self) {
+        let Some(peer) = self.selected_peer().cloned() else {
+            self.relay_sync_jobs.clear();
+            return;
+        };
+        let addr_key = peer.addr.to_string();
+        if let Some(folder) = self.relay_sync_map.get(&addr_key).cloned() {
+            if folder.exists() {
+                self.relay_sync_jobs = vec![SyncJob {
+                    folder,
+                    peer_addr: peer.addr,
+                    peer_name: peer.name.clone(),
+                    file_mtimes: std::collections::HashMap::new(),
+                }];
+            } else {
+                self.relay_sync_jobs.clear();
+            }
+        } else {
+            self.relay_sync_jobs.clear();
         }
     }
 }
@@ -3218,6 +3546,38 @@ impl App {
         };
         let x_pad = (avail_w - col_w) / 2.0;
         let peer_available = self.selected_peer_available();
+        let is_relay_mode = self.is_relay_mode;
+
+        // Clone the sync log to avoid borrowing issues
+        let sync_log_clone = if is_relay_mode {
+            self.relay_sync_log.clone()
+        } else {
+            self.sync_log.clone()
+        };
+        let sync_active = if is_relay_mode { self.relay_sync_active } else { self.sync_active };
+        let current_folder = if is_relay_mode {
+            self.selected_peer()
+                .and_then(|peer| self.relay_sync_map.get(&peer.addr.to_string()))
+                .cloned()
+        } else {
+            self.selected_peer()
+                .and_then(|peer| self.sync_map.get(&peer.addr.to_string()))
+                .cloned()
+        };
+        let sent_count = if is_relay_mode {
+            self.relay_sync_jobs.first().map(|j| j.file_mtimes.len()).unwrap_or(0)
+        } else {
+            self.sync_jobs.first().map(|j| j.file_mtimes.len()).unwrap_or(0)
+        };
+        let has_folder = if is_relay_mode {
+            self.selected_peer()
+                .and_then(|p| self.relay_sync_map.get(&p.addr.to_string()))
+                .is_some()
+        } else {
+            self.selected_peer()
+                .and_then(|p| self.sync_map.get(&p.addr.to_string()))
+                .is_some()
+        };
 
         egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui, |ui| {
             ui.add_space(24.0);
@@ -3229,32 +3589,58 @@ impl App {
                     ui.horizontal(|ui| {
                         icon_badge(ui, "📁", p.accent);
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Folder Sync").strong().size(15.0).color(p.text));
+                        if is_relay_mode {
+                            ui.label(RichText::new("Remote Folder Sync").strong().size(15.0).color(p.text));
+                        } else {
+                            ui.label(RichText::new("Folder Sync").strong().size(15.0).color(p.text));
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if self.sync_active {
-                                if ui.add(pill_btn(&format!("{}  Stop watching", icons::ICON_STOP_CIRCLE), p.danger)).clicked() {
-                                    self.stop_sync();
+                            if is_relay_mode {
+                                if sync_active {
+                                    if ui.add(pill_btn(&format!("{}  Stop remote sync", icons::ICON_STOP_CIRCLE), p.danger)).clicked() {
+                                        self.stop_relay_sync();
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.spinner();
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new("Syncing remotely…").size(11.0).color(p.success));
+                                } else if peer_available {
+                                    if has_folder {
+                                        if ui.add(big_btn(&format!("{}  Start remote sync", icons::ICON_SYNC), p.accent)).clicked() {
+                                            self.rebuild_relay_sync_jobs();
+                                            self.start_relay_sync_watcher();
+                                        }
+                                    }
                                 }
-                                ui.add_space(8.0);
-                                ui.spinner();
-                                ui.add_space(4.0);
-                                ui.label(RichText::new("Watching…").size(11.0).color(p.success));
-                            } else if peer_available {
-                                let has_folder = self.sync_map
-                                    .contains_key(&self.selected_peer()
-                                        .map(|p| p.addr.to_string()).unwrap_or_default());
-                                if has_folder {
-                                    if ui.add(big_btn(&format!("{}  Start watching", icons::ICON_SYNC), p.accent)).clicked() {
-                                        self.rebuild_sync_jobs();
-                                        self.start_sync_watcher();
+                            } else {
+                                if sync_active {
+                                    if ui.add(pill_btn(&format!("{}  Stop watching", icons::ICON_STOP_CIRCLE), p.danger)).clicked() {
+                                        self.stop_sync();
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.spinner();
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new("Watching…").size(11.0).color(p.success));
+                                } else if peer_available {
+                                    if has_folder {
+                                        if ui.add(big_btn(&format!("{}  Start watching", icons::ICON_SYNC), p.accent)).clicked() {
+                                            self.rebuild_sync_jobs();
+                                            self.start_sync_watcher();
+                                        }
                                     }
                                 }
                             }
                         });
                     });
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Add folders below. New files dropped in are automatically sent to the selected device.")
-                        .size(12.0).color(p.text_dim));
+
+                    if is_relay_mode {
+                        ui.label(RichText::new("Add folders below. New files added will be automatically sent to the remote device via relay.")
+                            .size(12.0).color(p.text_dim));
+                    } else {
+                        ui.label(RichText::new("Add folders below. New files dropped in are automatically sent to the selected device.")
+                            .size(12.0).color(p.text_dim));
+                    }
                     ui.add_space(14.0);
 
                     if !peer_available {
@@ -3264,7 +3650,10 @@ impl App {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("⚠").size(14.0).color(p.warn));
                                     ui.add_space(6.0);
-                                    if !self.saved_peer_name.is_empty() {
+                                    if is_relay_mode {
+                                        ui.label(RichText::new("No remote connection active. Connect via remote mode first.")
+                                            .size(12.0).color(p.warn));
+                                    } else if !self.saved_peer_name.is_empty() {
                                         ui.label(RichText::new(format!("{} is not available  ·  scan to reconnect",
                                             self.saved_peer_name)).size(12.0).color(p.warn));
                                     } else {
@@ -3277,34 +3666,36 @@ impl App {
                     }
 
                     ui.add_enabled_ui(peer_available, |ui| {
-                        let has_folder = self.selected_peer()
-                            .and_then(|p| self.sync_map.get(&p.addr.to_string()))
-                            .is_some();
-                        let lbl = if has_folder { &format!("{}  Change folder", icons::ICON_FOLDER) }
-                                    else { &format!("{}  Set folder to watch", icons::ICON_FOLDER) };
-                        if ui.add(pill_btn(lbl, p.accent)).clicked() {
+                        let btn_text = if is_relay_mode {
+                            if has_folder { &format!("{}  Change remote folder", icons::ICON_FOLDER) }
+                            else { &format!("{}  Set remote folder to sync", icons::ICON_FOLDER) }
+                        } else {
+                            if has_folder { &format!("{}  Change folder", icons::ICON_FOLDER) }
+                            else { &format!("{}  Set folder to watch", icons::ICON_FOLDER) }
+                        };
+                        if ui.add(pill_btn(btn_text, p.accent)).clicked() {
                             if !self.is_pro() {
                                 self.show_upgrade = true;
+                            } else if is_relay_mode && !self.is_relay_mode {
+                                self.remote_msg = Some(("Please connect via remote mode first".into(), true));
                             } else if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                self.add_sync_folder(folder);
+                                if is_relay_mode {
+                                    self.add_relay_sync_folder(folder);
+                                } else {
+                                    self.add_sync_folder(folder);
+                                }
                             }
                         }
                     });
                     ui.add_space(12.0);
 
-                    let current_folder: Option<PathBuf> = self.selected_peer()
-                        .and_then(|peer| self.sync_map.get(&peer.addr.to_string()))
-                        .cloned();
-
                     if let Some(ref folder) = current_folder {
                         let folder_exists = folder.exists();
-                        let sent_count = self.sync_jobs.first()
-                            .map(|j| j.file_mtimes.len()).unwrap_or(0);
                         let border_col = if !folder_exists { tint(p.warn, 55) }
-                                            else if self.sync_active { tint(p.success, 55) }
+                                            else if sync_active { tint(p.success, 55) }
                                             else { p.border };
                         let fill_col   = if !folder_exists { tint(p.warn, 10) }
-                                            else if self.sync_active { tint(p.success, 8) }
+                                            else if sync_active { tint(p.success, 8) }
                                             else { p.surface };
 
                         egui::Frame::new().fill(fill_col).stroke(Stroke::new(1.0, border_col))
@@ -3326,8 +3717,12 @@ impl App {
                                                 folder.file_name().unwrap_or_default().to_string_lossy())
                                                 .strong().size(13.0).color(p.text));
                                             ui.add_space(6.0);
-                                            if self.sync_active {
-                                                status_badge(ui, "WATCHING", p.success);
+                                            if sync_active {
+                                                if is_relay_mode {
+                                                    status_badge(ui, "REMOTE SYNC", p.success);
+                                                } else {
+                                                    status_badge(ui, "WATCHING", p.success);
+                                                }
                                             }
                                             if !folder_exists {
                                                 status_badge(ui, "MISSING", p.warn);
@@ -3337,8 +3732,14 @@ impl App {
                                         let display = if full.len() > 50 {
                                             format!("…{}", &full[full.len().saturating_sub(48)..])
                                         } else { full.to_string() };
-                                        ui.label(RichText::new(format!("{}  ·  {} file{} synced",
-                                            display, sent_count, if sent_count==1{""} else{"s"}))
+                                        let sync_text = if is_relay_mode {
+                                            format!("{}  ·  {} file{} synced remotely",
+                                                display, sent_count, if sent_count==1{""} else{"s"})
+                                        } else {
+                                            format!("{}  ·  {} file{} synced",
+                                                display, sent_count, if sent_count==1{""} else{"s"})
+                                        };
+                                        ui.label(RichText::new(sync_text)
                                             .size(11.0).color(p.text_dim));
                                     });
 
@@ -3347,7 +3748,11 @@ impl App {
                                             RichText::new(icons::ICON_CLOSE).size(13.0).color(p.text_dim))
                                             .frame(false)).clicked()
                                         {
-                                            self.remove_sync_folder();
+                                            if is_relay_mode {
+                                                self.remove_relay_sync_folder();
+                                            } else {
+                                                self.remove_sync_folder();
+                                            }
                                         }
                                     });
                                 });
@@ -3360,14 +3765,18 @@ impl App {
                             ui.label(RichText::new("No folder selected yet")
                                 .size(13.0).color(p.text_dim));
                             ui.add_space(4.0);
-                            ui.label(RichText::new(
-                                "Click 'Set folder' above, new files added will be automatically sent to the selected device.")
+                            let help_text = if is_relay_mode {
+                                "Click 'Set remote folder' above. New files added will be automatically sent to the remote device via relay."
+                            } else {
+                                "Click 'Set folder' above, new files added will be automatically sent to the selected device."
+                            };
+                            ui.label(RichText::new(help_text)
                                 .size(11.0).color(p.text_faint));
                             ui.add_space(18.0);
                         });
                     }
 
-                    if !self.sync_log.is_empty() && peer_available {
+                    if !sync_log_clone.is_empty() && peer_available {
                         ui.add_space(16.0);
                         ui.separator();
                         ui.add_space(8.0);
@@ -3379,7 +3788,11 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.add(pill_btn("Clear", p.text_faint)).clicked() {
-                                        self.sync_log.clear();
+                                        if is_relay_mode {
+                                            self.relay_sync_log.clear();
+                                        } else {
+                                            self.sync_log.clear();
+                                        }
                                     }
                                 },
                             );
@@ -3399,7 +3812,7 @@ impl App {
                                     .stick_to_bottom(true)
                                     .show(ui, |ui| {
                                         ui.set_min_width(ui.available_width());
-                                        for line in self.sync_log.iter().rev() {
+                                        for line in sync_log_clone.iter().rev() {
                                             let col = if line.starts_with("OK") { p.success }
                                                         else if line.starts_with("...") { p.text_dim }
                                                         else { p.danger };
@@ -3415,7 +3828,7 @@ impl App {
             ui.add_space(24.0);
         });
 
-        if self.sync_active {
+        if self.sync_active || self.relay_sync_active {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
     }
@@ -3806,6 +4219,7 @@ impl App {
 fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
     let file_exists = entry.file_exists();
     let is_received = entry.direction == TransferDir::Received;
+    let is_remote = entry.transfer_type == TransferType::Remote;
 
     let (fill, border) = if !file_exists && is_received {
         (tint(p.warn, 10), tint(p.warn, 45))
@@ -3865,6 +4279,12 @@ fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
                         }
                         if !file_exists && is_received {
                             status_badge(ui, "DELETED", p.warn);
+                        }
+                        // Add remote/local badge
+                        if is_remote {
+                            status_badge(ui, "REMOTE", p.accent2);
+                        } else {
+                            status_badge(ui, "LOCAL", p.success);
                         }
                     });
                     ui.add_space(2.0);
@@ -4262,6 +4682,7 @@ fn receive_server(state: Arc<Mutex<RecvState>>, save_dir: PathBuf) {
                 append_history(&HistoryEntry {
                     timestamp: ts,
                     direction: TransferDir::Received,
+                    transfer_type: TransferType::Local,
                     file_name: f.name.clone(),
                     file_size: f.size,
                     peer_name: f.peer_name.clone(),
@@ -4668,9 +5089,13 @@ fn send_file_via_relay(
     relay_stream: &mut TcpStream,
     on_progress: impl Fn(f32) + Send + 'static,
 ) -> Result<(), String> {
-    // Set timeouts
-    relay_stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
-    relay_stream.set_write_timeout(Some(std::time::Duration::from_secs(300)))?;
+    // Set timeouts - handle errors properly
+    if let Err(e) = relay_stream.set_read_timeout(Some(std::time::Duration::from_secs(300))) {
+        return Err(format!("Failed to set read timeout: {}", e));
+    }
+    if let Err(e) = relay_stream.set_write_timeout(Some(std::time::Duration::from_secs(300))) {
+        return Err(format!("Failed to set write timeout: {}", e));
+    }
 
     // Key exchange
     let sender_secret = EphemeralSecret::random_from_rng(AeadOsRng);
@@ -4855,43 +5280,6 @@ fn receive_file_via_relay(
         seen: false,
         peer_name: sender_hostname,
     })
-}
-
-fn receive_server_relay(relay_stream: TcpStream, state: Arc<Mutex<RecvState>>, save_dir: PathBuf) {
-    thread::spawn(move || {
-        match receive_file_via_relay(relay_stream, &save_dir) {
-            Ok(f) => {
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                append_history(&HistoryEntry {
-                    timestamp: ts,
-                    direction: TransferDir::Received,
-                    file_name: f.name.clone(),
-                    file_size: f.size,
-                    peer_name: f.peer_name.clone(),
-                    success: true,
-                    error: None,
-                    file_path: Some(f.path.clone()),
-                });
-                if let Ok(mut s) = state.lock() {
-                    s.recv_bytes += f.size;
-                    s.recv_files += 1;
-                    let auto_open = s.auto_open_folder;
-                    if auto_open {
-                        open_folder(&f.path);
-                    }
-                    s.files.push(f);
-                }
-            }
-            Err(e) => {
-                if let Ok(mut s) = state.lock() {
-                    s.error = Some(e);
-                }
-            }
-        }
-    });
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -5125,6 +5513,52 @@ fn file_icon(name: &str) -> &'static str {
         "xls" | "xlsx" | "csv" => "📊",
         "ppt" | "pptx" => "📽️",
         _ => "📁",
+    }
+}
+
+fn detect_system_theme() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // macOS dark mode detection
+        use std::process::Command;
+        let output = Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output();
+        matches!(output, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "Dark")
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows dark mode detection via registry
+        use winreg::RegKey;
+        use winreg::enums::HKEY_CURRENT_USER;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+        if let Ok(key) = hkcu.open_subkey(path) {
+            if let Ok(value) = key.get_value::<u32, _>("AppsUseLightTheme") {
+                return value == 0;
+            }
+        }
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux GTK dark mode detection
+        use std::process::Command;
+        let output = Command::new("gsettings")
+            .args(["get", "org.gnome.desktop.interface", "gtk-theme"])
+            .output();
+        if let Ok(o) = output {
+            let theme = String::from_utf8_lossy(&o.stdout);
+            return theme.to_lowercase().contains("dark");
+        }
+        false
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        false // Default to light mode
     }
 }
 
