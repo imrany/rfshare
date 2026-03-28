@@ -7,15 +7,27 @@ All changes to `src/main.rs` plus a new `relay/src/main.rs` for the server.
 ## Architecture
 
 ```
-Sender App                  Relay Server              Receiver App
-    |                           |                           |
-    |-- TCP connect ----------->|                           |
-    |-- "SENDER <code>\n" ----->|                           |
-    |                           |<-- TCP connect -----------|
-    |                           |<-- "RECEIVER <code>\n" --|
-    |                           |-- "PAIRED\n" ----------->|
-    |<-- "PAIRED\n" ------------|                           |
-    |<====== proxied E2E encrypted rfshare protocol ======>|
+┌─────────────┐                    ┌─────────────┐                    ┌─────────────┐
+│   Sender    │                    │    Relay    │                    │  Receiver   │
+│  (Client)   │                    │   Server    │                    │  (Client)   │
+└─────────────┘                    └─────────────┘                    └─────────────┘
+      │                                   │                                   │
+      │                                   │ 1. Receiver: "Go Online"          │
+      │                                   │<──────────────────────────────────│
+      │                                   │    GET /receiver/ABC123           │
+      │                                   │                                   │
+      │                                   │ 2. Returns share code: ABC123     │
+      │                                   │──────────────────────────────────>│
+      │                                   │                                   │
+      │ 3. Sender: Enter code ABC123      │                                   │
+      │──────────────────────────────────>│                                   │
+      │    GET /sender/ABC123             │                                   │
+      │                                   │                                   │
+      │                                   │ 4. Pair connections               │
+      │                                   │                                   │
+      │ 5. Bidirectional encrypted pipe   │                                   │
+      │<════════════════════════════════════════════════════════════════════>│
+      │                                   │                                   │
 ```
 
 - Both sides connect **outbound** on port 443 (or 9000) — no port forwarding

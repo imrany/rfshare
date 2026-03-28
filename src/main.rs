@@ -97,9 +97,11 @@ fn relay_listen(tx: std::sync::mpsc::Sender<RelayMsg>) {
             let request = format!(
                 "GET /receiver/{} HTTP/1.1\r\n\
                  Host: {}\r\n\
+                 User-Agent: {}/{}\r\n\
+                 Accept: */*\r\n\
                  Connection: keep-alive\r\n\
                  \r\n",
-                code, RELAY_HOST
+                code, RELAY_HOST, env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")
             );
 
             if stream.write_all(request.as_bytes()).is_err() {
@@ -162,9 +164,11 @@ fn relay_connect(code: &str, tx: std::sync::mpsc::Sender<RelayMsg>) {
             let request = format!(
                 "GET /sender/{} HTTP/1.1\r\n\
                  Host: {}\r\n\
+                 User-Agent: {}/{}\r\n\
+                 Accept: */*\r\n\
                  Connection: keep-alive\r\n\
                  \r\n",
-                code, RELAY_HOST
+                code, RELAY_HOST, env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")
             );
 
             if stream.write_all(request.as_bytes()).is_err() {
@@ -186,7 +190,7 @@ fn relay_connect(code: &str, tx: std::sync::mpsc::Sender<RelayMsg>) {
                 return;
             }
 
-            // Read headers
+            // Read headers until empty line
             let mut line = String::new();
             while let Ok(len) = reader.read_line(&mut line) {
                 if len == 0 || line == "\r\n" || line == "\n" {
@@ -219,7 +223,6 @@ fn relay_connect(code: &str, tx: std::sync::mpsc::Sender<RelayMsg>) {
         }
     }
 }
-
 // ─── Persistence helpers ─────────────────────────────────────────────────────
 fn prefs_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join(env!("CARGO_PKG_NAME")).join("prefs.json"))

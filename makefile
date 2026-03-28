@@ -12,7 +12,7 @@
 #  make clean               → cargo clean
 
 APP     = rfshare
-VERSION = 0.13.0
+VERSION = 0.14.0
 TARGET  = target/release/$(APP)
 OS     := $(shell uname -s 2>/dev/null || echo Windows)
 

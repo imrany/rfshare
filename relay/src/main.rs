@@ -121,73 +121,100 @@ fn handle_http_request(mut stream: TcpStream, peer: &str) -> Option<String> {
 
             let parts: Vec<&str> = first_line.trim().split_whitespace().collect();
             if parts.len() >= 2 {
+                let method = parts[0];
                 let path = parts[1];
 
-                if path.starts_with("/receiver/") {
-                    let code = path.strip_prefix("/receiver/").unwrap_or("");
-                    if !code.is_empty() {
-                        info!("Receiver request for code: {}", code);
-                        // Read and discard remaining headers - FIXED
-                        let mut line = String::new();
-                        loop {
-                            line.clear();
-                            if reader.read_line(&mut line).map_or(true, |len| len == 0 || line.trim().is_empty()) {
-                                break;
+                let mut headers = Vec::new();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break, // EOF
+                        Ok(len) => {
+                            if len == 0 || line == "\r\n" || line == "\n" {
+                                break; // End of headers
                             }
+                            headers.push(line.clone());
+                            line.clear();
                         }
-
-                        let response = format!(
-r#"HTTP/1.1 200 OK
-Content-Type: text/plain
-Connection: keep-alive
-Content-Length: {}
-
-RECEIVER {}"#,
-                            format!("RECEIVER {}", code).len(),
-                            code
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
-                        return Some(format!("RECEIVER {}", code));
+                        Err(e) => {
+                            warn!("Error reading header: {}", e);
+                            break;
+                        }
                     }
                 }
-                else if path.starts_with("/sender/") {
-                    let code = path.strip_prefix("/sender/").unwrap_or("");
-                    if !code.is_empty() {
-                        info!("Sender request for code: {}", code);
-                        // Read and discard remaining headers - FIXED
-                        let mut line = String::new();
-                        loop {
-                            line.clear();
-                            if reader.read_line(&mut line).map_or(true, |len| len == 0 || line.trim().is_empty()) {
-                                break;
+
+                if method == "GET" {
+                    if path.starts_with("/receiver/") {
+                        let code = path.strip_prefix("/receiver/").unwrap_or("");
+                        if !code.is_empty() {
+                            info!("Receiver request for code: {}", code);
+
+                            let response_body = format!("RECEIVER {}", code);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\n\
+                                 Content-Type: text/plain\r\n\
+                                 Content-Length: {}\r\n\
+                                 Connection: keep-alive\r\n\
+                                 \r\n\
+                                 {}",
+                                response_body.len(),
+                                response_body
+                            );
+
+                            if let Err(e) = stream.write_all(response.as_bytes()) {
+                                error!("Failed to write response: {}", e);
+                                return None;
                             }
+                            if let Err(e) = stream.flush() {
+                                error!("Failed to flush: {}", e);
+                            }
+
+                            return Some(response_body);
                         }
+                    } else if path.starts_with("/sender/") {
+                        let code = path.strip_prefix("/sender/").unwrap_or("");
+                        if !code.is_empty() {
+                            info!("Sender request for code: {}", code);
 
-                        let response = format!(
-r#"HTTP/1.1 200 OK
-Content-Type: text/plain
-Connection: keep-alive
-Content-Length: {}
+                            let response_body = format!("SENDER {}", code);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\n\
+                                 Content-Type: text/plain\r\n\
+                                 Content-Length: {}\r\n\
+                                 Connection: keep-alive\r\n\
+                                 \r\n\
+                                 {}",
+                                response_body.len(),
+                                response_body
+                            );
 
-SENDER {}"#,
-                            format!("SENDER {}", code).len(),
-                            code
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
-                        return Some(format!("SENDER {}", code));
+                            if let Err(e) = stream.write_all(response.as_bytes()) {
+                                error!("Failed to write response: {}", e);
+                                return None;
+                            }
+                            if let Err(e) = stream.flush() {
+                                error!("Failed to flush: {}", e);
+                            }
+
+                            return Some(response_body);
+                        }
                     }
                 }
             }
+
+            // If we get here, it's not a valid HTTP request
+            warn!("Invalid HTTP request from {}: {}", peer, first_line.trim());
+            let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
+            None
         }
         Err(e) => {
             warn!("Error reading HTTP request: {}", e);
+            None
         }
     }
-    None
 }
-
 fn handle_raw_command(stream: TcpStream, peer: &str) -> Option<String> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut line = String::new();
