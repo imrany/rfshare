@@ -33,7 +33,7 @@ const MAGIC_DONE: u8 = 0x04;
 const MAGIC_SKIP: u8 = 0x05; // receiver already has this version — sender should skip
 const SYNC_POLL_MS: u64 = 2_000; // how often the sync watcher polls each folder
 const RELAY_HOST: &str = "relay.triple-ts-mediclinic.com";
-const RELAY_PORT: u16  = 443;
+const RELAY_PORT: u16  = 80;
 
 //  network monitoring
 struct NetworkMonitor {
