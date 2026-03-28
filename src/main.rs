@@ -345,9 +345,6 @@ fn toggle_switch(ui: &mut egui::Ui, p: &Pal, on: bool) -> egui::Response {
 }
 
 fn fetch_latest_version() -> Option<String> {
-    // Try GitHub API first (more reliable)
-    let api_url = format!("https://api.github.com/repos/imrany/{}/releases/latest", env!("CARGO_PKG_NAME"));
-
     let mut stream = match std::net::TcpStream::connect(("api.github.com", 443)) {
         Ok(s) => s,
         Err(_) => {
@@ -426,7 +423,7 @@ fn fetch_version_alternative() -> Option<String> {
         return None;
     }
 
-    let mut reader = BufReader::new(stream);
+    let reader = BufReader::new(stream);
     for line in reader.lines().take(30).flatten() {
         if line.to_ascii_lowercase().starts_with("location:") {
             if let Some(tag) = line.rsplit('/').next() {
@@ -5621,12 +5618,12 @@ fn detect_system_theme() -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        // Windows dark mode detection via registry
         use winreg::RegKey;
         use winreg::enums::HKEY_CURRENT_USER;
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
         if let Ok(key) = hkcu.open_subkey(path) {
+            // Fix: Specify the type explicitly
             if let Ok(value) = key.get_value::<u32, _>("AppsUseLightTheme") {
                 return value == 0;
             }

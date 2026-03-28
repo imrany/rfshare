@@ -31,6 +31,7 @@ minreq = { version = "2.14.1", features = ["https"] }
 
 # Windows: embed icon + version info into the .exe
 [target.'cfg(target_os = "windows")'.build-dependencies]
+winreg = "0.56.0"
 winresource = "0.1"
 
 [profile.release]
