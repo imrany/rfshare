@@ -2367,18 +2367,16 @@ impl eframe::App for App {
         }
 
         // Handle tray events
-        if let Some(tray) = &self.tray {
-            while let Some(event) = tray.try_recv() {
-                match event {
-                    TrayEvent::ShowWindow => {
-                        println!("Tray: Show window");
-                        self.window_visible = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                    TrayEvent::Quit => {
-                        std::process::exit(0);
-                    }
+        while let Some(event) = self.tray.as_ref().and_then(|t| t.try_recv()) {
+            match event {
+                TrayEvent::ShowWindow => {
+                    self.window_visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayEvent::Quit => {
+                    self.persist_prefs();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         }
