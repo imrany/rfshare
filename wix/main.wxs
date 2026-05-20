@@ -3,7 +3,7 @@
 
   <Package
         Name="rfshare"
-        Version="0.15.0"
+        Version="0.16.0"
         Manufacturer="Imrany"
         Language="1033"
         UpgradeCode="B1A2C3D4-E5F6-7890-ABCD-EF1234567890"
