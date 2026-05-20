@@ -65,16 +65,6 @@ curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install
 Installs the `.deb` package on Debian/Ubuntu (includes desktop entry and icon).  
 Falls back to a bare binary on other distros.
 
-> **Note for GNOME users**: Tray icons are hidden by default. Install the AppIndicator extension:
- ```bash
-
-sudo apt install gnome-shell-extension-manager
-sudo apt install gnome-shell-extension-appindicator
- # Then enable it via Extension Manager or gnome-extensions
-## extension-manager
-# gnome-extensions list
-```
-
 > **User-only install (no sudo):**
 > ```bash
 > PREFIX=$HOME/.local curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash
