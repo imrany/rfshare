@@ -17,7 +17,6 @@
 - **🎨 Modern UI** - Clean interface with dark/light theme support
 - **🖱️ Drag & Drop** - Simply drag files into the app to add them to the queue
 - **📱 Cross-Platform** - Works on Windows, macOS, and Linux
-- **🖥️ System Tray Support** - Minimize to system tray and continue running in background
 
 ### Technical Highlights
 - **Resumable Transfers** - Interrupted transfers can be resumed from where they stopped
