@@ -26,7 +26,6 @@
 - **Smart Sync** - Only syncs files that have changed (uses modification timestamps)
 - **Network Monitoring** - Automatically detects IP changes and reconnects
 - **No Cloud Storage** - Files never leave your devices or relay server (relay only pipes encrypted data)
-- **System Tray Integration** - App stays alive in background when window is closed
 
 ## 📸 Demonstration
 
@@ -154,17 +153,11 @@ Each file has a matching `.sha256` checksum.
    - Desktop notifications appear when transfers complete
    - View received files in the **History** tab
 
-4. **System Tray** (Optional):
-   - Click the close button (X) to minimize to tray
-   - The app continues running in background
-   - Right-click the tray icon to show/hide the window or quit
-   - Configure in **Settings** → **Preferences** → **System Tray**
-
-5. **Remote sharing (Pro)**:
+4. **Remote sharing (Pro)**:
    - **Receiver**: Click **Scan** → **Remote** → **Go Online** → Share the code
    - **Sender**: Click **Scan** → **Remote** → Enter code → **Connect** → Send files
 
-6. **Folder sync (Pro)**:
+5. **Folder sync (Pro)**:
    - Select a device
    - Go to **Sync** tab
    - Click **Set folder to watch**
@@ -212,7 +205,6 @@ Each file has a matching `.sha256` checksum.
 | Transfer History | ✅ | ✅ |
 | Drag & Drop | ✅ | ✅ |
 | Desktop Notifications | ✅ | ✅ |
-| System Tray Support | ✅ | ✅ |
 | **Remote Transfer** | ❌ | ✅ |
 | **Folder Sync** | ❌ | ✅ |
 | **Remote Folder Sync** | ❌ | ✅ |
@@ -301,7 +293,6 @@ cargo build --release
 3. **Backup Sync** - Automatically sync folders to another computer
 4. **Quick File Transfer** - Fast, no-server transfers between devices
 5. **Secure Sharing** - Encrypted transfers for sensitive files
-6. **Background Operations** - Keep app running in tray while working
 
 ## 🐛 Troubleshooting
 
@@ -326,16 +317,6 @@ cargo build --release
 - **Windows**: Start Menu → rfshare
 - **macOS**: Applications folder → rfshare.app
 - **Linux**: Run `rfshare` in terminal or find in application menu
-
-**Q: Tray icon doesn't appear on Linux/GNOME**
-- GNOME hides tray icons by default
-- Install and enable the AppIndicator extension:
-  ```bash
-  sudo apt install gnome-shell-extension-appindicator
-  gnome-extensions enable ubuntu-appindicators@ubuntu.com
-  # Restart GNOME Shell (Alt+F2 → r)
-  ```
-- For other desktop environments, tray icons work out of the box
 
 **Q: Folder sync isn't working**
 - Ensure you have a Pro license activated
@@ -377,7 +358,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [RustCrypto](https://github.com/RustCrypto) - Cryptographic implementations
 - [x25519-dalek](https://github.com/dalek-cryptography/x25519-dalek) - X25519 implementation
 - [egui_material_icons](https://crates.io/crates/egui_material_icons) - Material Design icons
-- [tray-icon](https://crates.io/crates/tray-icon) - Cross-platform system tray support
 
 ## 📞 Support
 
