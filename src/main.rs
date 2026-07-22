@@ -3416,193 +3416,61 @@ fn status_metric(ui: &mut egui::Ui, p: &Pal, icon: &str, text: &str) {
 
 /// Scan for paired/known Bluetooth devices. Returns a (possibly empty) list.
 fn scan_bluetooth_peers() -> Vec<Peer> {
-    #[cfg(target_os = "linux")]
-    {
-        scan_bluetooth_peers_linux()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        scan_bluetooth_peers_windows()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
-        Vec::new()
-    }
-}
+    let mut discovered = Vec::new();
 
-#[cfg(target_os = "linux")]
-fn scan_bluetooth_peers_linux() -> Vec<Peer> {
-    use bluer::Session;
-    use futures::StreamExt as _;
-
+    // Create a local Tokio runtime to execute btleplug's async API synchronously
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Ok(rt) => rt,
+        Err(_) => return discovered,
     };
 
     rt.block_on(async {
-        let session = match Session::new().await {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
+        use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
+        use btleplug::platform::Manager;
+
+        let manager = match Manager::new().await {
+            Ok(m) => m,
+            Err(_) => return,
         };
-        let adapter = match session.default_adapter().await {
+
+        let adapters = match manager.adapters().await {
             Ok(a) => a,
-            Err(_) => return Vec::new(),
+            Err(_) => return,
         };
 
-        // Enumerate already-known paired devices (fast, no discovery needed)
-        let addresses = match adapter.device_addresses().await {
-            Ok(a) => a,
-            Err(_) => return Vec::new(),
-        };
+        for adapter in adapters {
+            if adapter.start_scan(ScanFilter::default()).await.is_err() {
+                continue;
+            }
 
-        let mut peers = Vec::new();
-        for addr in addresses {
-            let device = match adapter.device(addr) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
+            // Scan for 3 seconds per adapter
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-            // Only show paired devices
-            let paired = device.is_paired().await.unwrap_or(false);
-            if !paired { continue; }
+            if let Ok(peripherals) = adapter.peripherals().await {
+                for peripheral in peripherals {
+                    if let Ok(Some(properties)) = peripheral.properties().await {
+                        let name = properties
+                            .local_name
+                            .unwrap_or_else(|| "Unknown BT Device".to_string());
+                        let address = properties.address.to_string();
 
-            let name = device.name().await.unwrap_or(None)
-                .unwrap_or_else(|| addr.to_string());
-            let addr_str = addr.to_string();
+                        // Dummy IP assigned for UI selection binding
+                        let dummy_ip: std::net::IpAddr = "127.0.0.3".parse().unwrap();
 
-            // Derive a stable dummy loopback IP from the BT address bytes for de-dup purposes
-            let octets = addr.0;
-            let dummy_ip: std::net::IpAddr = std::net::IpAddr::V4(
-                std::net::Ipv4Addr::new(127, 100, octets[4], octets[5])
-            );
-
-            peers.push(Peer {
-                name,
-                addr: dummy_ip,
-                kind: PeerKind::Bluetooth(addr_str.clone()),
-                latency: None,
-                bt_addr: Some(addr_str),
-            });
+                        discovered.push(Peer {
+                            name,
+                            addr: dummy_ip,
+                            kind: PeerKind::Bluetooth(address.clone()),
+                            latency: None,
+                            bt_addr: Some(address),
+                        });
+                    }
+                }
+            }
         }
-        peers
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn scan_bluetooth_peers_windows() -> Vec<Peer> {
-    // Windows Bluetooth enumeration via the `windows` crate.
-    // We look for paired devices using BluetoothFindFirstDevice / BluetoothFindNextDevice
-    // via the winapi crate's ws2bth structures. This is a best-effort stub; a full
-    // implementation would call SetupDiGetClassDevs with GUID_BTHPORT_DEVICE_INTERFACE.
-    // For now we return an empty list on Windows and let the WiFi path handle transfers.
-    Vec::new()
-}
-
-// ─── Bluetooth file transfer (Linux only via bluer RFCOMM) ───────────────────
-
-/// Send a file over Bluetooth RFCOMM (Linux).
-/// Uses the same encrypted protocol as the TCP path.
-#[cfg(target_os = "linux")]
-fn send_file_via_bluetooth(
-    path: &std::path::Path,
-    name: &str,
-    file_size: u64,
-    bt_addr_str: &str,
-    batch_info: Option<(u32, u32, u64)>,
-    on_progress: &dyn Fn(f32),
-) -> Result<(), String> {
-    use bluer::rfcomm::{Socket as RfcommSocket, SocketAddr as RfcommAddr};
-    use bluer::Address;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let path         = path.to_path_buf();
-    let name         = name.to_string();
-    let bt_addr_str  = bt_addr_str.to_string();
-    let batch_info_c = batch_info;
-
-    // We need to bridge async bluer I/O with the sync on_progress callback.
-    // Use a channel to pass progress updates out.
-    let (prog_tx, prog_rx) = std::sync::mpsc::channel::<f32>();
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all().build()
-        .map_err(|e| format!("Tokio: {}", e))?;
-
-    let result: Result<(), String> = rt.block_on(async move {
-        let addr: Address = bt_addr_str.parse()
-            .map_err(|_| "Invalid Bluetooth address".to_string())?;
-        let socket = RfcommSocket::new()
-            .map_err(|e| format!("BT socket: {}", e))?;
-        let rfcomm_addr = RfcommAddr::new(addr, RFCOMM_CHANNEL);
-        let mut stream = socket.connect(rfcomm_addr).await
-            .map_err(|e| format!("BT connect: {}", e))?;
-
-        // ── Key exchange (same as TCP) ──────────────────────────────────
-        let sender_secret = EphemeralSecret::random_from_rng(AeadOsRng);
-        let sender_pub    = PublicKey::from(&sender_secret);
-        stream.write_all(sender_pub.as_bytes()).await.map_err(|e| e.to_string())?;
-        stream.flush().await.map_err(|e| e.to_string())?;
-
-        let mut recv_pub_bytes = [0u8; X25519_KEY_LEN];
-        stream.read_exact(&mut recv_pub_bytes).await.map_err(|e| e.to_string())?;
-        let receiver_pub = PublicKey::from(recv_pub_bytes);
-        let shared       = sender_secret.diffie_hellman(&receiver_pub);
-        let aes_key      = derive_key(shared.as_bytes());
-        let cipher       = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
-
-        // ── OFFER message ──────────────────────────────────────────────
-        let nb = name.as_bytes();
-        let hn = hostname();
-        let hb = hn.as_bytes();
-        let mut offer = Vec::with_capacity(1 + 4 + nb.len() + 8 + 4 + hb.len() + 16);
-        offer.push(MAGIC_OFFER);
-        offer.extend_from_slice(&(nb.len() as u32).to_le_bytes());
-        offer.extend_from_slice(nb);
-        offer.extend_from_slice(&file_size.to_le_bytes());
-        offer.extend_from_slice(&(hb.len() as u32).to_le_bytes());
-        offer.extend_from_slice(hb);
-        if let Some((file_idx, total_files, total_bytes)) = batch_info_c {
-            offer.extend_from_slice(&total_files.to_le_bytes());
-            offer.extend_from_slice(&file_idx.to_le_bytes());
-            offer.extend_from_slice(&total_bytes.to_le_bytes());
-        }
-        write_encrypted_async(&mut stream, &cipher, &offer).await?;
-        stream.flush().await.map_err(|e| e.to_string())?;
-
-        // Wait for RESUME
-        let mut magic_buf = [0u8; 1];
-        stream.read_exact(&mut magic_buf).await.map_err(|e| e.to_string())?;
-        if magic_buf[0] != MAGIC_RESUME { return Err("Bad handshake response".into()); }
-
-        let resume_payload = read_encrypted_async(&mut stream, &cipher).await?;
-        if resume_payload.len() < 8 { return Err("Short resume payload".into()); }
-        let resume_offset = u64::from_le_bytes(resume_payload[..8].try_into().unwrap());
-
-        // ── Stream file data ───────────────────────────────────────────
-        let mut file = fs::File::open(&path).map_err(|e| format!("Cannot open: {}", e))?;
-        if resume_offset > 0 {
-            file.seek(SeekFrom::Start(resume_offset)).map_err(|e| e.to_string())?;
-        }
-        let mut sent = resume_offset;
-        let mut buf  = vec![0u8; CHUNK_SIZE];
-        loop {
-            let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-            if n == 0 { break; }
-            stream.write_all(&[MAGIC_DATA]).await.map_err(|e| e.to_string())?;
-            write_encrypted_async(&mut stream, &cipher, &buf[..n]).await?;
-            sent += n as u64;
-            if file_size > 0 { let _ = prog_tx.send(sent as f32 / file_size as f32); }
-        }
-        stream.write_all(&[MAGIC_DONE]).await.map_err(|e| e.to_string())?;
-        stream.flush().await.map_err(|e| e.to_string())?;
-        Ok(())
     });
 
-    // Drain progress updates
-    while let Ok(p) = prog_rx.try_recv() { on_progress(p); }
-
-    result
+    discovered
 }
 
 /// Async encrypt-then-write helper for Bluetooth streams.
@@ -3899,15 +3767,234 @@ fn send_file_resumable_bluetooth(
     batch_info: Option<(u32, u32, u64)>,
     on_progress: &dyn Fn(f32),
 ) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        send_file_via_bluetooth(path, name, file_size, bt_addr, batch_info, on_progress)
+    // Implement Bluetooth L2CAP/RFCOMM socket connection here
+    // macOS / Windows / Linux handle Bluetooth socket protocols differently via native OS bindings
+    send_file_via_bluetooth(path, name, file_size, bt_addr, batch_info, on_progress)
+}
+
+// ─── Bluetooth file transfer (Linux only via bluer RFCOMM) ───────────────────
+
+/// Send a file over Bluetooth RFCOMM (Linux).
+/// Uses the same encrypted protocol as the TCP path.
+#[cfg(target_os = "linux")]
+fn send_file_via_bluetooth(
+    path: &std::path::Path,
+    name: &str,
+    file_size: u64,
+    bt_addr_str: &str,
+    batch_info: Option<(u32, u32, u64)>,
+    on_progress: &dyn Fn(f32),
+) -> Result<(), String> {
+    use bluer::rfcomm::{Socket as RfcommSocket, SocketAddr as RfcommAddr};
+    use bluer::Address;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let path = path.to_path_buf();
+    let name = name.to_string();
+    let bt_addr_str = bt_addr_str.to_string();
+    let (prog_tx, prog_rx) = std::sync::mpsc::channel::<f32>();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Tokio runtime error: {}", e))?;
+
+    let result = rt.block_on(async move {
+        let addr: Address = bt_addr_str.parse().map_err(|_| "Invalid Bluetooth address".to_string())?;
+        let socket = RfcommSocket::new().map_err(|e| format!("BT socket creation error: {}", e))?;
+        let rfcomm_addr = RfcommAddr::new(addr, RFCOMM_CHANNEL);
+        let mut stream = socket.connect(rfcomm_addr).await.map_err(|e| format!("BT connect error: {}", e))?;
+
+        // Perform encrypted handshake & stream logic
+        perform_bt_handshake_and_stream_async(&mut stream, &path, &name, file_size, batch_info, prog_tx).await
+    });
+
+    while let Ok(p) = prog_rx.try_recv() {
+        on_progress(p);
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (path, name, file_size, bt_addr, batch_info, on_progress);
-        Err("Bluetooth transfer not supported on this platform".into())
+
+    result
+
+}
+
+#[cfg(target_os = "linux")]
+async fn perform_bt_handshake_and_stream_async<S>(
+    stream: &mut S,
+    path: &std::path::Path,
+    name: &str,
+    file_size: u64,
+    batch_info: Option<(u32, u32, u64)>,
+    prog_tx: std::sync::mpsc::Sender<f32>,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 1. Key Exchange
+    let sender_secret = EphemeralSecret::random_from_rng(AeadOsRng);
+    let sender_pub = PublicKey::from(&sender_secret);
+    stream.write_all(sender_pub.as_bytes()).await.map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+
+    let mut recv_pub_bytes = [0u8; X25519_KEY_LEN];
+    stream.read_exact(&mut recv_pub_bytes).await.map_err(|e| e.to_string())?;
+    let receiver_pub = PublicKey::from(recv_pub_bytes);
+    let shared = sender_secret.diffie_hellman(&receiver_pub);
+    let aes_key = derive_key(shared.as_bytes());
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
+
+    // 2. Offer Payload Construction
+    let nb = name.as_bytes();
+    let hn = hostname();
+    let hb = hn.as_bytes();
+    let mut offer = Vec::with_capacity(1 + 4 + nb.len() + 8 + 4 + hb.len() + 16);
+    offer.push(MAGIC_OFFER);
+    offer.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+    offer.extend_from_slice(nb);
+    offer.extend_from_slice(&file_size.to_le_bytes());
+    offer.extend_from_slice(&(hb.len() as u32).to_le_bytes());
+    offer.extend_from_slice(hb);
+    if let Some((file_idx, total_files, total_bytes)) = batch_info {
+        offer.extend_from_slice(&total_files.to_le_bytes());
+        offer.extend_from_slice(&file_idx.to_le_bytes());
+        offer.extend_from_slice(&total_bytes.to_le_bytes());
     }
+    write_encrypted_async(stream, &cipher, &offer).await?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+
+    // 3. Resume Handshake
+    let mut magic_buf = [0u8; 1];
+    stream.read_exact(&mut magic_buf).await.map_err(|e| e.to_string())?;
+    if magic_buf[0] != MAGIC_RESUME {
+        return Err("Bad handshake response".into());
+    }
+
+    let resume_payload = read_encrypted_async(stream, &cipher).await?;
+    if resume_payload.len() < 8 {
+        return Err("Short resume payload".into());
+    }
+    let resume_offset = u64::from_le_bytes(resume_payload[..8].try_into().unwrap());
+
+    // 4. Send File Chunks
+    let mut file = fs::File::open(path).map_err(|e| format!("Cannot open: {}", e))?;
+    if resume_offset > 0 {
+        file.seek(SeekFrom::Start(resume_offset)).map_err(|e| e.to_string())?;
+    }
+    let mut sent = resume_offset;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        stream.write_all(&[MAGIC_DATA]).await.map_err(|e| e.to_string())?;
+        write_encrypted_async(stream, &cipher, &buf[..n]).await?;
+        sent += n as u64;
+        if file_size > 0 {
+            let _ = prog_tx.send(sent as f32 / file_size as f32);
+        }
+    }
+    stream.write_all(&[MAGIC_DONE]).await.map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+// ─── Windows Implementation ─────────────────────────────────────────────────
+#[cfg(target_os = "windows")]
+fn send_file_via_bluetooth(
+    path: &std::path::Path,
+    name: &str,
+    file_size: u64,
+    bt_addr_str: &str,
+    batch_info: Option<(u32, u32, u64)>,
+    on_progress: &dyn Fn(f32),
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use windows::Win32::Networking::WinSock::*;
+
+    // Parse MAC Address (e.g., "00:11:22:33:44:55" or "001122334455")
+    let clean_addr = bt_addr_str.replace(":", "").replace("-", "");
+    let mac_num = u64::from_str_radix(&clean_addr, 16)
+        .map_err(|_| "Invalid Windows Bluetooth MAC address format".to_string())?;
+
+    unsafe {
+        let mut wsa_data = WSADATA::default();
+        if WSAStartup(0x0202, &mut wsa_data) != 0 {
+            return Err("WSAStartup failed".into());
+        }
+
+        let sock = socket(AF_BTH as i32, SOCK_STREAM as i32, BTHPROTO_RFCOMM as i32);
+        if sock == INVALID_SOCKET {
+            WSACleanup();
+            return Err("Failed to create RFCOMM socket".into());
+        }
+
+        let mut sa = SOCKADDR_BTH::default();
+        sa.addressFamily = AF_BTH;
+        sa.btAddr = mac_num;
+        sa.port = RFCOMM_CHANNEL as u32;
+
+        let conn_res = connect(
+            sock,
+            &sa as *const _ as *const SOCKADDR,
+            std::mem::size_of::<SOCKADDR_BTH>() as i32,
+        );
+
+        if conn_res == SOCKET_ERROR {
+            closesocket(sock);
+            WSACleanup();
+            return Err("Bluetooth connection failed on Windows".into());
+        }
+
+        // Bridge raw SOCKET into standard Rust I/O stream using std::os::windows::io
+        use std::os::windows::io::FromRawSocket;
+        let mut stream = std::net::TcpStream::from_raw_socket(sock as _);
+
+        // Perform synchronous handshake and streaming using standard Read/Write
+        let res = perform_bt_handshake_and_stream_sync(&mut stream, path, name, file_size, batch_info, on_progress);
+
+        WSACleanup();
+        res
+    }
+}
+
+// ─── macOS / Generic Fallback Implementation ─────────────────────────
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn send_file_via_bluetooth(
+    path: &std::path::Path,
+    name: &str,
+    file_size: u64,
+    bt_addr_str: &str,
+    batch_info: Option<(u32, u32, u64)>,
+    on_progress: &dyn Fn(f32),
+) -> Result<(), String> {
+    use btleplug::api::{Central, Manager as _, Peripheral as _};
+    use btleplug::platform::Manager;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Tokio runtime error: {}", e))?;
+
+    rt.block_on(async {
+        let manager = Manager::new().await.map_err(|e| format!("BT Manager error: {}", e))?;
+        let adapters = manager.adapters().await.map_err(|e| format!("Adapter error: {}", e))?;
+        let adapter = adapters.into_iter().next().ok_or("No Bluetooth adapter found")?;
+
+        let peripherals = adapter.peripherals().await.map_err(|e| format!("Peripheral error: {}", e))?;
+        let peripheral = peripherals
+            .into_iter()
+            .find(|p| p.address().to_string() == bt_addr_str)
+            .ok_or_else(|| format!("Target device {} not found", bt_addr_str))?;
+
+        peripheral.connect().await.map_err(|e| format!("Connect error: {}", e))?;
+
+        // macOS Bluetooth LE GATT implementation stream logic
+        Err("macOS BLE stream transport requires GATT characteristic matching".to_string())
+    })
 }
 
 // ─── File transfer — receive ──────────────────────────────────────────────────
