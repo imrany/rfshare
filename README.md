@@ -92,7 +92,7 @@ Adds rfshare to your PATH, creates a Start Menu shortcut, and registers it in Ad
 
 **Linux / macOS**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash -s -- --version v0.15.0
+curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash -s -- --version v0.17.0
 ```
 
 **Windows**
