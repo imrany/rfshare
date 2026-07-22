@@ -3926,27 +3926,27 @@ fn send_file_via_bluetooth(
             return Err("WSAStartup failed".into());
         }
 
-        let sock = socket(AF_BTH as i32, SOCK_STREAM as i32, BTHPROTO_RFCOMM as i32);
+        let sock = match socket(AF_BTH as i32, SOCK_STREAM as i32, BTHPROTO_RFCOMM as i32) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Socket creation failed: {}", e);
+                return;
+            }
+        };
+
         if sock == INVALID_SOCKET {
-            WSACleanup();
-            return Err("Failed to create RFCOMM socket".into());
+            eprintln!("Invalid socket created");
+            return;
         }
 
-        let mut sa = SOCKADDR_BTH::default();
-        sa.addressFamily = AF_BTH;
-        sa.btAddr = mac_num;
-        sa.port = RFCOMM_CHANNEL as u32;
+        let mut sa = SOCKADDR_ATM::default();
 
-        let conn_res = connect(
-            sock,
-            &sa as *const _ as *const SOCKADDR,
-            std::mem::size_of::<SOCKADDR_BTH>() as i32,
-        );
+        // Now sock can be used directly with connect() and closesocket()
+        let conn_res = connect(sock, &sa);
 
-        if conn_res == SOCKET_ERROR {
+        if let Err(e) = conn_res {
+            eprintln!("Connect failed: {}", e);
             closesocket(sock);
-            WSACleanup();
-            return Err("Bluetooth connection failed on Windows".into());
         }
 
         // Bridge raw SOCKET into standard Rust I/O stream using std::os::windows::io
