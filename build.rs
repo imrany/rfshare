@@ -1,6 +1,9 @@
 fn main() {
     #[cfg(target_os = "windows")]
     {
+        println!("cargo:rustc-link-lib=ws2_32");
+        println!("cargo:rustc-link-lib=mswsock");
+
         let mut res = winresource::WindowsResource::new();
 
         // Embed the .ico so Explorer / taskbar / Alt+Tab shows the icon
