@@ -386,7 +386,7 @@ fn device_row(
     is_remote: bool,
 ) -> egui::Response {
     let fill = if selected { tint(p.accent, 30) } else { Color32::TRANSPARENT };
-    let stroke = if selected { Stroke::new(1.0, tint(p.accent, 60)) } else { Stroke::NONE };
+    let stroke = if selected { Stroke::new(1.0_f32, tint(p.accent, 60)) } else { Stroke::NONE };
 
     let (rect, resp) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), 44.0), Sense::click());
@@ -1446,7 +1446,7 @@ impl App {
         ui.label(RichText::new("Save Location").strong().size(13.0).color(p.text_dim));
         ui.add_space(8.0);
         egui::Frame::new()
-            .fill(p.surface2).stroke(Stroke::new(1.0, p.border))
+            .fill(p.surface2).stroke(Stroke::new(1.0_f32, p.border))
             .corner_radius(10.0).inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
@@ -1487,7 +1487,7 @@ impl App {
         ui.label(RichText::new("Notifications").strong().size(13.0).color(p.text_dim));
         ui.add_space(8.0);
         egui::Frame::new()
-            .fill(p.surface2).stroke(Stroke::new(1.0, p.border))
+            .fill(p.surface2).stroke(Stroke::new(1.0_f32, p.border))
             .corner_radius(10.0).inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
@@ -1528,7 +1528,7 @@ impl App {
         ui.label(RichText::new("Appearance").strong().size(13.0).color(p.text_dim));
         ui.add_space(8.0);
         egui::Frame::new()
-            .fill(p.surface2).stroke(Stroke::new(1.0, p.border))
+            .fill(p.surface2).stroke(Stroke::new(1.0_f32, p.border))
             .corner_radius(10.0).inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
@@ -1559,7 +1559,7 @@ impl App {
                             ui.add_enabled_ui(!disabled, |ui| {
                                 if ui.add(egui::Button::new(RichText::new(lbl).size(12.0).color(col))
                                     .fill(fill)
-                                    .stroke(Stroke::new(1.0, if active && !disabled { p.accent } else { p.border }))
+                                    .stroke(Stroke::new(1.0_f32, if active && !disabled { p.accent } else { p.border }))
                                     .corner_radius(6.0)
                                     .min_size(Vec2::new(60.0, 28.0))).clicked()
                                 {
@@ -1794,20 +1794,20 @@ impl eframe::App for App {
             v.faint_bg_color     = p.surface2;
             v.override_text_color = Some(p.text);
             v.widgets.noninteractive.bg_fill   = p.surface;
-            v.widgets.noninteractive.bg_stroke  = Stroke::new(1.0, p.border);
-            v.widgets.noninteractive.fg_stroke  = Stroke::new(1.0, p.text_dim);
+            v.widgets.noninteractive.bg_stroke  = Stroke::new(1.0_f32, p.border);
+            v.widgets.noninteractive.fg_stroke  = Stroke::new(1.0_f32, p.text_dim);
             v.widgets.inactive.bg_fill   = p.surface2;
-            v.widgets.inactive.fg_stroke  = Stroke::new(1.0, p.text);
+            v.widgets.inactive.fg_stroke  = Stroke::new(1.0_f32, p.text);
             v.widgets.hovered.bg_fill    = tint(p.accent, 20);
-            v.widgets.hovered.fg_stroke   = Stroke::new(1.5, p.accent);
+            v.widgets.hovered.fg_stroke   = Stroke::new(1.5_f32, p.accent);
             v.widgets.active.bg_fill     = tint(p.accent, 38);
-            v.widgets.active.fg_stroke    = Stroke::new(1.5, p.accent);
+            v.widgets.active.fg_stroke    = Stroke::new(1.5_f32, p.accent);
             v.widgets.open.bg_fill       = p.surface2;
-            v.widgets.open.fg_stroke      = Stroke::new(1.0, p.text);
+            v.widgets.open.fg_stroke      = Stroke::new(1.0_f32, p.text);
             v.selection.bg_fill  = tint(p.accent, 50);
-            v.selection.stroke   = Stroke::new(1.0, p.accent);
+            v.selection.stroke   = Stroke::new(1.0_f32, p.accent);
             v.window_corner_radius = CornerRadius::same(14);
-            v.window_stroke = Stroke::new(1.0, p.border);
+            v.window_stroke = Stroke::new(1.0_f32, p.border);
             v
         });
 
@@ -1835,7 +1835,7 @@ impl eframe::App for App {
             egui::Window::new("Upgrade to Pro")
                 .collapsible(false).resizable(false).min_width(360.0)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .frame(egui::Frame::new().fill(p2.surface).stroke(Stroke::new(1.0, p2.border)).corner_radius(16.0))
+                .frame(egui::Frame::new().fill(p2.surface).stroke(Stroke::new(1.0_f32, p2.border)).corner_radius(16.0))
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.vertical_centered(|ui| {
@@ -1922,7 +1922,7 @@ impl eframe::App for App {
                                 let r = resp.rect;
                                 ui.painter().line_segment(
                                     [egui::pos2(r.left() + 4.0, r.bottom() - 1.0), egui::pos2(r.right() - 4.0, r.bottom() - 1.0)],
-                                    Stroke::new(2.0, p.accent));
+                                    Stroke::new(2.0_f32, p.accent));
                             }
                             if *lbl == "History" && history_new > 0 {
                                 let dot = egui::pos2(resp.rect.right() + 4.0, resp.rect.top() + 11.0);
@@ -1941,7 +1941,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("statusbar")
             .frame(egui::Frame::new()
                 .fill(p.surface)
-                .stroke(Stroke::new(1.0, p.border))
+                .stroke(Stroke::new(1.0_f32, p.border))
                 .inner_margin(egui::Margin { left: 12, right: 12, top: 0, bottom: 0 }))
             .exact_height(28.0)
             .show(ctx, |ui| {
@@ -2074,7 +2074,7 @@ impl App {
                                     if ui.add(egui::Button::new(
                                         RichText::new(format!("{}  Rescan", icons::ICON_SEARCH)).size(12.0).color(Color32::WHITE))
                                         .fill(p.surface2).corner_radius(6.0)
-                                        .stroke(Stroke::new(1.0, p.border)).min_size(Vec2::new(80.0, 30.0))).clicked()
+                                        .stroke(Stroke::new(1.0_f32, p.border)).min_size(Vec2::new(80.0, 30.0))).clicked()
                                     {
                                         self.start_scan();
                                     }
@@ -2082,7 +2082,7 @@ impl App {
                                 ui.add_space(8.0);
                                 egui::Frame::new()
                                     .fill(p.bg)
-                                    .stroke(Stroke::new(1.0, if !self.scan_filter.is_empty() { p.accent } else { p.border }))
+                                    .stroke(Stroke::new(1.0_f32, if !self.scan_filter.is_empty() { p.accent } else { p.border }))
                                     .corner_radius(6.0)
                                     .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 5 })
                                     .show(ui, |ui| {
@@ -2330,7 +2330,7 @@ impl App {
                         let error_to_display = if let RelayState::Error(ref e) = self.relay_state { Some(e.clone()) } else { None };
                         if let Some(e) = error_to_display {
                             egui::Frame::new()
-                                .fill(tint(p.danger, 10)).stroke(Stroke::new(1.0, tint(p.danger, 40)))
+                                .fill(tint(p.danger, 10)).stroke(Stroke::new(1.0_f32, tint(p.danger, 40)))
                                 .corner_radius(8.0).inner_margin(egui::Margin::same(10))
                                 .show(ui, |ui| {
                                     ui.set_width((ui.available_width() - 40.0).min(500.0));
@@ -2353,7 +2353,7 @@ impl App {
                                 ui.vertical_centered(|ui| {
                                     // Receive card
                                     egui::Frame::new()
-                                        .fill(p.surface).stroke(Stroke::new(1.0, p.border))
+                                        .fill(p.surface).stroke(Stroke::new(1.0_f32, p.border))
                                         .corner_radius(10.0).inner_margin(egui::Margin::same(14))
                                         .show(ui, |ui| {
                                             ui.set_width(card_width);
@@ -2375,7 +2375,7 @@ impl App {
                                     ui.add_space(12.0);
                                     // Send card
                                     egui::Frame::new()
-                                        .fill(p.surface).stroke(Stroke::new(1.0, p.border))
+                                        .fill(p.surface).stroke(Stroke::new(1.0_f32, p.border))
                                         .corner_radius(10.0).inner_margin(egui::Margin::same(14))
                                         .show(ui, |ui| {
                                             ui.set_width(card_width);
@@ -2387,7 +2387,7 @@ impl App {
                                                 ui.label(RichText::new("Enter the code from the receiver").size(11.0).color(p.text_dim));
                                                 ui.add_space(10.0);
                                                 egui::Frame::new()
-                                                    .fill(p.bg).stroke(Stroke::new(1.0, p.border))
+                                                    .fill(p.bg).stroke(Stroke::new(1.0_f32, p.border))
                                                     .corner_radius(6.0)
                                                     .inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 6 })
                                                     .show(ui, |ui| {
@@ -2434,7 +2434,7 @@ impl App {
 
                         ui.add_space(32.0);
                         egui::Frame::new()
-                            .fill(tint(p.surface2, 50)).stroke(Stroke::new(1.0, p.border))
+                            .fill(tint(p.surface2, 50)).stroke(Stroke::new(1.0_f32, p.border))
                             .corner_radius(8.0).inner_margin(egui::Margin::same(12))
                             .show(ui, |ui| {
                                 ui.set_width((ui.available_width() - 40.0).min(500.0));
@@ -2485,7 +2485,7 @@ impl App {
                             ui.label(RichText::new("Your share code").size(12.0).color(p.text_dim));
                             ui.add_space(8.0);
                             egui::Frame::new()
-                                .fill(tint(p.accent, 18)).stroke(Stroke::new(2.0, tint(p.accent, 60)))
+                                .fill(tint(p.accent, 18)).stroke(Stroke::new(2.0_f32, tint(p.accent, 60)))
                                 .corner_radius(12.0)
                                 .inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 16 })
                                 .show(ui, |ui| {
@@ -2526,7 +2526,7 @@ impl App {
         if let Some(peer) = self.selected_peer().cloned() {
             let p2 = self.p();
             egui::Frame::new()
-                .fill(tint(p2.accent, 15)).stroke(Stroke::new(1.0, tint(p2.accent, 45)))
+                .fill(tint(p2.accent, 15)).stroke(Stroke::new(1.0_f32, tint(p2.accent, 45)))
                 .corner_radius(6.0).inner_margin(egui::Margin { left: 12, right: 8, top: 6, bottom: 6 })
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
@@ -2553,7 +2553,7 @@ impl App {
         } else {
             let p2 = self.p();
             egui::Frame::new()
-                .fill(tint(p2.warn, 10)).stroke(Stroke::new(1.0, tint(p2.warn, 40)))
+                .fill(tint(p2.warn, 10)).stroke(Stroke::new(1.0_f32, tint(p2.warn, 40)))
                 .corner_radius(6.0).inner_margin(egui::Margin { left: 12, right: 8, top: 6, bottom: 6 })
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
@@ -2748,7 +2748,7 @@ impl App {
                     if !self.history.is_empty() {
                         egui::Frame::new()
                             .fill(p.surface2)
-                            .stroke(Stroke::new(1.0, if !self.history_filter.is_empty() { p.accent } else { p.border }))
+                            .stroke(Stroke::new(1.0_f32, if !self.history_filter.is_empty() { p.accent } else { p.border }))
                             .corner_radius(8.0).inner_margin(egui::Margin { left: 10, right: 10, top: 6, bottom: 6 })
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
@@ -2869,7 +2869,7 @@ impl App {
                     ui.add_space(14.0);
 
                     if !peer_available {
-                        egui::Frame::new().fill(tint(p.warn, 12)).stroke(Stroke::new(1.0, tint(p.warn, 50)))
+                        egui::Frame::new().fill(tint(p.warn, 12)).stroke(Stroke::new(1.0_f32, tint(p.warn, 50)))
                             .corner_radius(8.0).inner_margin(egui::Margin::same(12))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -2911,7 +2911,7 @@ impl App {
                         let folder_exists = folder.exists();
                         let border_col = if !folder_exists { tint(p.warn, 55) } else if sync_active { tint(p.success, 55) } else { p.border };
                         let fill_col   = if !folder_exists { tint(p.warn, 10) } else if sync_active { tint(p.success, 8) } else { p.surface };
-                        egui::Frame::new().fill(fill_col).stroke(Stroke::new(1.0, border_col))
+                        egui::Frame::new().fill(fill_col).stroke(Stroke::new(1.0_f32, border_col))
                             .corner_radius(10.0).inner_margin(egui::Margin { left: 14, right: 14, top: 12, bottom: 12 })
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
@@ -3045,7 +3045,7 @@ impl App {
         let p = self.p();
         if !self.saved_peer_name.is_empty() {
             egui::Frame::new()
-                .fill(p.surface).stroke(Stroke::new(1.0, p.border))
+                .fill(p.surface).stroke(Stroke::new(1.0_f32, p.border))
                 .corner_radius(12.0).inner_margin(egui::Margin::same(14))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
@@ -3067,7 +3067,7 @@ impl App {
         }
 
         egui::Frame::new()
-            .fill(p.surface).stroke(Stroke::new(1.0, p.border))
+            .fill(p.surface).stroke(Stroke::new(1.0_f32, p.border))
             .corner_radius(12.0).inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
@@ -3083,7 +3083,7 @@ impl App {
         if self.session_sent_bytes > 0 || self.session_sent_files > 0 {
             ui.add_space(16.0);
             egui::Frame::new()
-                .fill(p.surface).stroke(Stroke::new(1.0, p.border))
+                .fill(p.surface).stroke(Stroke::new(1.0_f32, p.border))
                 .corner_radius(12.0).inner_margin(egui::Margin::same(14))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
@@ -3107,7 +3107,7 @@ impl App {
         let p = self.p();
         if self.is_pro() {
             egui::Frame::new()
-                .fill(tint(p.pro, 15)).stroke(Stroke::new(1.0, tint(p.pro, 55)))
+                .fill(tint(p.pro, 15)).stroke(Stroke::new(1.0_f32, tint(p.pro, 55)))
                 .corner_radius(12.0).inner_margin(egui::Margin::same(16))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -3208,7 +3208,7 @@ fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
     let (fill, border) = if !file_exists && is_received { (tint(p.warn, 10), tint(p.warn, 45)) }
         else if !entry.success { (tint(p.danger, 10), tint(p.danger, 50)) }
         else { (p.surface, p.border) };
-    egui::Frame::new().fill(fill).stroke(Stroke::new(1.0, border))
+    egui::Frame::new().fill(fill).stroke(Stroke::new(1.0_f32, border))
         .corner_radius(10.0).inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 10 })
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -3267,7 +3267,7 @@ fn queue_item_row(ui: &mut egui::Ui, p: &Pal, item: &QueueItem, idx: usize, remo
         else if item.is_failed() { (tint(p.danger, 55), tint(p.danger, 10)) }
         else if item.is_active() { (tint(p.accent, 55), tint(p.accent, 10)) }
         else                     { (p.border, p.surface2) };
-    egui::Frame::new().fill(fill).stroke(Stroke::new(1.0, border_col))
+    egui::Frame::new().fill(fill).stroke(Stroke::new(1.0_f32, border_col))
         .corner_radius(10.0).inner_margin(egui::Margin { left: 10, right: 10, top: 8, bottom: 8 })
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -3307,7 +3307,7 @@ fn queue_item_row(ui: &mut egui::Ui, p: &Pal, item: &QueueItem, idx: usize, remo
 fn drop_zone(ui: &mut egui::Ui, p: &Pal, hovering: bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 86.0), Sense::hover());
     let fill   = if hovering { tint(p.accent, 22) } else { p.surface2 };
-    let stroke  = if hovering { Stroke::new(2.0, p.accent) } else { Stroke::new(1.0, p.border) };
+    let stroke  = if hovering { Stroke::new(2.0_f32, p.accent) } else { Stroke::new(1.0_f32, p.border) };
     ui.painter().rect(rect, CornerRadius::same(10), fill, stroke, egui::StrokeKind::Outside);
     ui.painter().text(rect.center() - Vec2::new(0.0, 11.0), egui::Align2::CENTER_CENTER,
         icons::ICON_ARROW_UPWARD, egui::FontId::proportional(20.0),
@@ -3320,7 +3320,7 @@ fn drop_zone(ui: &mut egui::Ui, p: &Pal, hovering: bool) {
 fn drop_hint(ui: &mut egui::Ui, p: &Pal, hovering: bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
     let fill   = if hovering { tint(p.accent, 18) } else { Color32::TRANSPARENT };
-    let stroke  = if hovering { Stroke::new(1.0, p.accent) } else { Stroke::new(1.0, tint(p.border, 100)) };
+    let stroke  = if hovering { Stroke::new(1.0_f32, p.accent) } else { Stroke::new(1.0_f32, tint(p.border, 100)) };
     ui.painter().rect(rect, CornerRadius::same(8), fill, stroke, egui::StrokeKind::Outside);
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
         if hovering { "Release to add more files" } else { "+ Drop more files here" },
@@ -3350,7 +3350,7 @@ fn tint(c: Color32, a: u8) -> Color32 {
 }
 
 fn card<R>(ui: &mut egui::Ui, p: &Pal, f: impl FnOnce(&mut egui::Ui) -> R) {
-    egui::Frame::new().fill(p.surface).stroke(Stroke::new(1.0, p.border))
+    egui::Frame::new().fill(p.surface).stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(14.0).inner_margin(egui::Margin { left: 18, right: 18, top: 16, bottom: 16 })
         .show(ui, |ui| { ui.set_min_width(ui.available_width()); f(ui); });
 }
@@ -3378,7 +3378,7 @@ fn check_item(ui: &mut egui::Ui, p: &Pal, done: bool, label: &str) {
             ui.painter().circle_filled(r.center(), 7.0, tint(p.success, 30));
             ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icons::ICON_CHECK, egui::FontId::proportional(12.0), p.success);
         } else {
-            ui.painter().circle_stroke(r.center(), 7.0, Stroke::new(1.0, p.text_faint));
+            ui.painter().circle_stroke(r.center(), 7.0, Stroke::new(1.0_f32, p.text_faint));
         }
         ui.add_space(4.0);
         ui.label(RichText::new(label).size(12.0).color(if done { p.text } else { p.text_dim }));
@@ -3393,11 +3393,11 @@ fn radar_graphic(ui: &mut egui::Ui, p: &Pal, pulse: f32, animated: bool) {
             let phase = (pulse - i as f32 * 0.6).sin() * 0.5 + 0.5;
             let r     = 12.0 + i as f32 * 16.0;
             let a     = (phase * 100.0) as u8;
-            ui.painter().circle_stroke(c, r, Stroke::new(1.5, tint(p.accent, a)));
+            ui.painter().circle_stroke(c, r, Stroke::new(1.5_f32, tint(p.accent, a)));
         }
     } else {
         for (r, a) in [(36u8, 35u8), (26, 55), (16, 80)] {
-            ui.painter().circle_stroke(c, r as f32, Stroke::new(1.0, tint(p.accent, a)));
+            ui.painter().circle_stroke(c, r as f32, Stroke::new(1.0_f32, tint(p.accent, a)));
         }
     }
     ui.painter().circle_filled(c, 9.0, tint(p.accent, 180));

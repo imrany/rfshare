@@ -42,7 +42,7 @@ minreq = { version = "2.14.1", features = ["https"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.56.0"
-winapi = { version = "0.3.9", features = ["winuser", "shellapi", "winsock2", "ws2bth"] }
+winapi = { version = "0.3.9", features = ["winuser", "shellapi", "winsock2", "ws2bth", "winsock2"] }
 windows = { version = "0.58.0", features = ["Networking_Sockets", "Devices_Bluetooth"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
