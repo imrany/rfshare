@@ -3912,8 +3912,8 @@ fn send_file_via_bluetooth(
     on_progress: &dyn Fn(f32),
 ) -> Result<(), String> {
     use std::io::{Read, Write};
-    use std::net::TcpStream;
     use windows::Win32::Networking::WinSock::*;
+    use std::os::windows::io::RawSocket;
 
     // Parse MAC Address (e.g., "00:11:22:33:44:55" or "001122334455")
     let clean_addr = bt_addr_str.replace(":", "").replace("-", "");
@@ -3926,38 +3926,35 @@ fn send_file_via_bluetooth(
             return Err("WSAStartup failed".into());
         }
 
+        // Create RFCOMM socket
         let sock = match socket(AF_BTH as i32, SOCK_STREAM as i32, BTHPROTO_RFCOMM as i32) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Socket creation failed: {}", e);
-                return;
+                WSACleanup();
+                return Err(format!("Socket creation failed: {}", e));
             }
         };
 
         if sock == INVALID_SOCKET {
-            eprintln!("Invalid socket created");
-            return;
+            WSACleanup();
+            return Err("Invalid socket created".into());
         }
 
-        let mut sa = SOCKADDR_ATM::default();
-
-        // Now sock can be used directly with connect() and closesocket()
-        let conn_res = connect(sock, &sa);
-
-        if let Err(e) = conn_res {
-            eprintln!("Connect failed: {}", e);
-            closesocket(sock);
-        }
-
-        // Bridge raw SOCKET into standard Rust I/O stream using std::os::windows::io
-        use std::os::windows::io::FromRawSocket;
-        let mut stream = std::net::TcpStream::from_raw_socket(sock as _);
-
-        // Perform synchronous handshake and streaming using standard Read/Write
-        let res = perform_bt_handshake_and_stream_sync(&mut stream, path, name, file_size, batch_info, on_progress);
-
+        // TODO: build a proper SOCKADDR_BTH and call connect(sock, &sockaddr_bth)
+        // The current code used SOCKADDR_ATM which is wrong for Bluetooth.
+        // If you don't yet have a working RFCOMM sockaddr implementation, fail early:
+        closesocket(sock);
         WSACleanup();
-        res
+        return Err("Windows RFCOMM connect not implemented; please implement SOCKADDR_BTH + connect".into());
+
+        // If/when you implement connect successfully, only then convert the raw socket into a TcpStream:
+        //
+        // use std::os::windows::io::FromRawSocket;
+        // let raw: RawSocket = sock as RawSocket;
+        // let mut stream = unsafe { std::net::TcpStream::from_raw_socket(raw) };
+        // let res = perform_bt_handshake_and_stream_sync(&mut stream, path, name, file_size, batch_info, on_progress);
+        // WSACleanup();
+        // return res;
     }
 }
 
