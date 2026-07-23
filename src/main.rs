@@ -3911,11 +3911,9 @@ fn send_file_via_bluetooth(
     batch_info: Option<(u32, u32, u64)>,
     on_progress: &dyn Fn(f32),
 ) -> Result<(), String> {
-    use std::io::{Read, Write};
     use windows::Win32::Networking::WinSock::*;
-    use std::os::windows::io::RawSocket;
-    use winapi::um::winsock2::{ socket, AF_BTH, SOCK_STREAM };
-    use winapi::shared::ws2def::BTHPROTO_RFCOMM;
+    use winapi::um::winsock2::{socket, SOCKET_ERROR, INVALID_SOCKET, SOCK_STREAM};
+    use winapi::um::ws2bth::{AF_BTH, BTHPROTO_RFCOMM};
 
     // Parse MAC Address (e.g., "00:11:22:33:44:55" or "001122334455")
     let clean_addr = bt_addr_str.replace(":", "").replace("-", "");
@@ -3929,13 +3927,12 @@ fn send_file_via_bluetooth(
         }
 
         // Create RFCOMM socket
-        let sock = match socket(AF_BTH as i32, SOCK_STREAM as i32, BTHPROTO_RFCOMM as i32) {
-            Ok(s) => s,
-            Err(e) => {
-                WSACleanup();
-                return Err(format!("Socket creation failed: {}", e));
-            }
-        };
+        let sock = unsafe { socket(AF_BTH as i32, SOCK_STREAM as i32, BTHPROTO_RFCOMM as i32) };
+
+        if sock == INVALID_SOCKET {
+            // Handle error (e.g., check WSAGetLastError())
+            return Err("Failed to create Bluetooth socket".to_string());
+        }
 
         if sock == INVALID_SOCKET {
             WSACleanup();
