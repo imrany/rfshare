@@ -3912,7 +3912,7 @@ fn send_file_via_bluetooth(
     on_progress: &dyn Fn(f32),
 ) -> Result<(), String> {
     use windows::Win32::Networking::WinSock::*;
-    use winapi::um::winsock2::{socket, SOCKET_ERROR, INVALID_SOCKET, SOCK_STREAM};
+    use winapi::um::winsock2::{socket, closesocket, INVALID_SOCKET, SOCK_STREAM};
     use winapi::um::ws2bth::{AF_BTH, BTHPROTO_RFCOMM};
 
     // Parse MAC Address (e.g., "00:11:22:33:44:55" or "001122334455")
@@ -3942,7 +3942,9 @@ fn send_file_via_bluetooth(
         // TODO: build a proper SOCKADDR_BTH and call connect(sock, &sockaddr_bth)
         // The current code used SOCKADDR_ATM which is wrong for Bluetooth.
         // If you don't yet have a working RFCOMM sockaddr implementation, fail early:
-        closesocket(sock);
+        unsafe {
+            closesocket(sock);
+        }
         WSACleanup();
         return Err("Windows RFCOMM connect not implemented; please implement SOCKADDR_BTH + connect".into());
 
