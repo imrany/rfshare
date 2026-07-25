@@ -17,6 +17,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::{EphemeralSecret, PublicKey};
+mod utils;
+use utils::{
+  detect_system_theme,
+  file_icon,
+  gen_session_code,
+  format_size,
+  hostname,
+  local_ip,
+  notify,
+  open_folder,
+  open_url,
+  truncate_filename,
+  unique_path,
+};
+mod ui;
+use ui::{card, big_btn, check_item, drop_hint, drop_zone,history_row,icon_badge,info_row,pill_btn, queue_item_row,
+    radar_graphic,status_badge,status_metric,tint};
 
 const DISCOVER_PORT:  u16   = 44444;
 const TRANSFER_PORT:  u16   = 44445;
@@ -69,23 +86,6 @@ impl NetworkMonitor {
     fn has_changed(&mut self) -> Option<String> {
         self.rx.try_recv().ok()
     }
-}
-
-/// Generate a random 8-char session code like "A3F7-K2M9"
-fn gen_session_code() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH).unwrap_or_default()
-        .subsec_nanos();
-    let chars: Vec<char> = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".chars().collect();
-    let mut n = seed as usize;
-    let mut code = String::new();
-    for i in 0..8 {
-        if i == 4 { code.push('-'); }
-        n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        code.push(chars[(n >> 33) % chars.len()]);
-    }
-    code
 }
 
 fn relay_listen(tx: std::sync::mpsc::Sender<RelayMsg>) {
@@ -524,7 +524,7 @@ impl License {
 }
 
 // ─── Palette ─────────────────────────────────────────────────────────────────
-struct Pal {
+pub struct Pal {
     bg: Color32, surface: Color32, surface2: Color32, border: Color32,
     text: Color32, text_dim: Color32, text_faint: Color32,
     accent: Color32, accent2: Color32,
@@ -572,7 +572,7 @@ enum TransferType { Local, Remote }
 
 // ─── History ─────────────────────────────────────────────────────────────────
 #[derive(Clone, Debug)]
-struct HistoryEntry {
+pub struct HistoryEntry {
     timestamp: u64,
     direction: TransferDir,
     file_name: String,
@@ -584,7 +584,7 @@ struct HistoryEntry {
     file_path: Option<PathBuf>,
 }
 #[derive(Clone, Debug, PartialEq)]
-enum TransferDir { Sent, Received }
+pub enum TransferDir { Sent, Received }
 
 impl HistoryEntry {
     fn time_display(&self) -> String {
@@ -3200,218 +3200,6 @@ impl App {
     }
 }
 
-// ─── Shared UI helpers ────────────────────────────────────────────────────────
-fn history_row(ui: &mut egui::Ui, p: &Pal, entry: &HistoryEntry) {
-    let file_exists = entry.file_exists();
-    let is_received = entry.direction == TransferDir::Received;
-    let is_remote   = entry.transfer_type == TransferType::Remote;
-    let (fill, border) = if !file_exists && is_received { (tint(p.warn, 10), tint(p.warn, 45)) }
-        else if !entry.success { (tint(p.danger, 10), tint(p.danger, 50)) }
-        else { (p.surface, p.border) };
-    egui::Frame::new().fill(fill).stroke(Stroke::new(1.0_f32, border))
-        .corner_radius(10.0).inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 10 })
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            let right_w = 88.0f32;
-            let total_w = ui.available_width();
-            let left_w  = (total_w - right_w - 10.0).max(80.0);
-            ui.horizontal(|ui| {
-                let (dir_icon, dir_col) = if entry.direction == TransferDir::Sent { (icons::ICON_UPLOAD, p.accent) } else { (icons::ICON_DOWNLOAD, p.success) };
-                let (r, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
-                ui.painter().circle_filled(r.center(), 15.0, tint(dir_col, 22));
-                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, dir_icon, egui::FontId::proportional(14.0), dir_col);
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.set_width(left_w - 52.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(truncate_filename(&entry.file_name, 32)).strong().size(12.5).color(p.text));
-                        ui.add_space(4.0);
-                        if !entry.success { status_badge(ui, "FAILED", p.danger); }
-                        if !file_exists && is_received { status_badge(ui, "DELETED", p.warn); }
-                        if is_remote { status_badge(ui, "REMOTE", p.accent2); } else { status_badge(ui, "LOCAL", p.success); }
-                    });
-                    ui.add_space(2.0);
-                    let dir_word = if entry.direction == TransferDir::Sent { "to" } else { "from" };
-                    ui.label(RichText::new(format!("{} {}  ·  {}", dir_word, entry.peer_name, format_size(entry.file_size)))
-                        .size(11.0).color(p.text_dim));
-                    if let Some(ref fpath) = entry.file_path {
-                        let path_str = fpath.to_string_lossy();
-                        let display = if path_str.len() > 50 { format!("…{}", &path_str[path_str.len().saturating_sub(48)..]) } else { path_str.to_string() };
-                        ui.label(RichText::new(display).size(10.0).color(p.text_faint));
-                    }
-                    if let Some(ref err) = entry.error {
-                        ui.label(RichText::new(truncate_filename(err, 50)).size(10.5).color(p.danger));
-                    }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.set_width(right_w);
-                    ui.vertical(|ui| {
-                        ui.set_width(right_w);
-                        ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
-                            ui.label(RichText::new(entry.time_display()).size(10.5).color(p.text_faint));
-                            if is_received && file_exists {
-                                if let Some(ref fpath) = entry.file_path {
-                                    ui.add_space(4.0);
-                                    if ui.add(pill_btn("Open folder", p.accent)).clicked() { open_folder(fpath); }
-                                }
-                            }
-                        });
-                    });
-                });
-            });
-        });
-}
-
-fn queue_item_row(ui: &mut egui::Ui, p: &Pal, item: &QueueItem, idx: usize, remove: &mut Option<usize>) {
-    let (border_col, fill) = if item.is_done()   { (tint(p.success, 55), tint(p.success, 10)) }
-        else if item.is_failed() { (tint(p.danger, 55), tint(p.danger, 10)) }
-        else if item.is_active() { (tint(p.accent, 55), tint(p.accent, 10)) }
-        else                     { (p.border, p.surface2) };
-    egui::Frame::new().fill(fill).stroke(Stroke::new(1.0_f32, border_col))
-        .corner_radius(10.0).inner_margin(egui::Margin { left: 10, right: 10, top: 8, bottom: 8 })
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(file_icon(&item.name)).size(20.0));
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(truncate_filename(&item.name, 35)).strong().size(12.0).color(p.text));
-                        ui.add_space(6.0);
-                        if item.is_done()   { status_badge(ui, "DONE",    p.success); }
-                        else if item.is_failed() { status_badge(ui, "FAILED",  p.danger); }
-                        else if item.is_active() { status_badge(ui, "SENDING", p.accent); }
-                    });
-                    ui.label(RichText::new(format_size(item.size)).size(10.5).color(p.text_dim));
-                    if let Some(progress) = item.progress {
-                        if progress < 1.0 {
-                            ui.add_space(4.0);
-                            ui.add(egui::ProgressBar::new(progress.clamp(0.0, 1.0))
-                                .desired_width(ui.available_width()).desired_height(9.0)
-                                .text(RichText::new(format!("{:.0}%", progress * 100.0)).size(10.0)));
-                        }
-                    }
-                    if let Some(ref err) = item.error { ui.label(RichText::new(err).size(10.0).color(p.danger)); }
-                });
-                if !item.is_active() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(RichText::new(icons::ICON_CLOSE).size(12.0).color(p.text_dim)).frame(false)).clicked() {
-                            *remove = Some(idx);
-                        }
-                    });
-                }
-            });
-        });
-}
-
-fn drop_zone(ui: &mut egui::Ui, p: &Pal, hovering: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 86.0), Sense::hover());
-    let fill   = if hovering { tint(p.accent, 22) } else { p.surface2 };
-    let stroke  = if hovering { Stroke::new(2.0_f32, p.accent) } else { Stroke::new(1.0_f32, p.border) };
-    ui.painter().rect(rect, CornerRadius::same(10), fill, stroke, egui::StrokeKind::Outside);
-    ui.painter().text(rect.center() - Vec2::new(0.0, 11.0), egui::Align2::CENTER_CENTER,
-        icons::ICON_ARROW_UPWARD, egui::FontId::proportional(20.0),
-        if hovering { p.accent } else { p.text_faint });
-    ui.painter().text(rect.center() + Vec2::new(0.0, 13.0), egui::Align2::CENTER_CENTER,
-        if hovering { "Release to add files" } else { "Drag & drop files  or  Browse…" },
-        egui::FontId::proportional(11.5), if hovering { p.text_dim } else { p.text_faint });
-}
-
-fn drop_hint(ui: &mut egui::Ui, p: &Pal, hovering: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
-    let fill   = if hovering { tint(p.accent, 18) } else { Color32::TRANSPARENT };
-    let stroke  = if hovering { Stroke::new(1.0_f32, p.accent) } else { Stroke::new(1.0_f32, tint(p.border, 100)) };
-    ui.painter().rect(rect, CornerRadius::same(8), fill, stroke, egui::StrokeKind::Outside);
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-        if hovering { "Release to add more files" } else { "+ Drop more files here" },
-        egui::FontId::proportional(11.0), if hovering { p.accent } else { p.text_faint });
-}
-
-fn info_row(ui: &mut egui::Ui, p: &Pal, icon: &str, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(Vec2::new(20.0, 16.0), Sense::hover());
-        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(13.0), p.text_faint);
-        ui.add_space(8.0);
-        ui.label(RichText::new(label).size(11.0).color(p.text_faint));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(value).size(11.5).color(p.text));
-        });
-    });
-}
-
-fn status_badge(ui: &mut egui::Ui, text: &str, color: Color32) {
-    egui::Frame::new().fill(tint(color, 25)).corner_radius(4.0)
-        .inner_margin(egui::Margin { left: 4, right: 4, top: 1, bottom: 1 })
-        .show(ui, |ui| { ui.label(RichText::new(text).size(8.5).strong().color(color)); });
-}
-
-fn tint(c: Color32, a: u8) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
-}
-
-fn card<R>(ui: &mut egui::Ui, p: &Pal, f: impl FnOnce(&mut egui::Ui) -> R) {
-    egui::Frame::new().fill(p.surface).stroke(Stroke::new(1.0_f32, p.border))
-        .corner_radius(14.0).inner_margin(egui::Margin { left: 18, right: 18, top: 16, bottom: 16 })
-        .show(ui, |ui| { ui.set_min_width(ui.available_width()); f(ui); });
-}
-
-fn icon_badge(ui: &mut egui::Ui, icon: &str, color: Color32) {
-    let (r, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
-    ui.painter().circle_filled(r.center(), 13.0, tint(color, 25));
-    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(13.0), color);
-}
-
-fn pill_btn(text: &str, accent: Color32) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_string()).size(12.0).color(accent))
-        .fill(tint(accent, 28)).corner_radius(20.0)
-}
-
-fn big_btn(text: &str, accent: Color32) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_string()).size(13.0).strong().color(Color32::WHITE))
-        .fill(accent).corner_radius(10.0).min_size(Vec2::new(150.0, 38.0))
-}
-
-fn check_item(ui: &mut egui::Ui, p: &Pal, done: bool, label: &str) {
-    ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-        if done {
-            ui.painter().circle_filled(r.center(), 7.0, tint(p.success, 30));
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icons::ICON_CHECK, egui::FontId::proportional(12.0), p.success);
-        } else {
-            ui.painter().circle_stroke(r.center(), 7.0, Stroke::new(1.0_f32, p.text_faint));
-        }
-        ui.add_space(4.0);
-        ui.label(RichText::new(label).size(12.0).color(if done { p.text } else { p.text_dim }));
-    });
-}
-
-fn radar_graphic(ui: &mut egui::Ui, p: &Pal, pulse: f32, animated: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(72.0), Sense::hover());
-    let c = rect.center();
-    if animated {
-        for i in 0..3u32 {
-            let phase = (pulse - i as f32 * 0.6).sin() * 0.5 + 0.5;
-            let r     = 12.0 + i as f32 * 16.0;
-            let a     = (phase * 100.0) as u8;
-            ui.painter().circle_stroke(c, r, Stroke::new(1.5_f32, tint(p.accent, a)));
-        }
-    } else {
-        for (r, a) in [(36u8, 35u8), (26, 55), (16, 80)] {
-            ui.painter().circle_stroke(c, r as f32, Stroke::new(1.0_f32, tint(p.accent, a)));
-        }
-    }
-    ui.painter().circle_filled(c, 9.0, tint(p.accent, 180));
-    ui.painter().text(c, egui::Align2::CENTER_CENTER, "✈", egui::FontId::proportional(11.0), Color32::WHITE);
-}
-
-fn status_metric(ui: &mut egui::Ui, p: &Pal, icon: &str, text: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(icon).size(11.0).color(p.text_faint));
-        ui.add_space(3.0);
-        ui.label(RichText::new(text).size(10.5).color(p.text_dim));
-    });
-}
-
 // ─── Bluetooth peer scanning ─────────────────────────────────────────────────
 
 /// Scan for paired/known Bluetooth devices. Returns a (possibly empty) list.
@@ -4276,179 +4064,6 @@ fn receive_file_via_relay(
         &format!("'{}' saved to {}", truncate_filename(&name, 45), save_dir.display()),
     );
     Ok(ReceivedFile { name, size: file_size, path: dest, seen: false, peer_name: sender_hostname })
-}
-
-// ─── Utilities ────────────────────────────────────────────────────────────────
-fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
-    let p = dir.join(name);
-    if !p.exists() { return p; }
-    let stem = std::path::Path::new(name).file_stem().unwrap_or_default().to_string_lossy().to_string();
-    let ext  = std::path::Path::new(name).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    for i in 1u32.. {
-        let c = dir.join(format!("{} ({}){}", stem, i, ext));
-        if !c.exists() { return c; }
-    }
-    p
-}
-
-fn truncate_filename(name: &str, max_len: usize) -> String {
-    if name.len() <= max_len { return name.to_string(); }
-    let mut t = name.to_string();
-    t.truncate(max_len);
-    format!("{}…{}", t, &name[name.len().saturating_sub(4)..])
-}
-
-fn local_ip() -> String {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn hostname() -> String {
-    std::process::Command::new("hostname").output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_else(|| "this-device".into())
-        .trim().to_string()
-}
-
-fn notify(title: &str, body: &str) -> Result<(), ()> {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("notify-send").arg(title).arg(body).spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let sc = format!("display notification \"{}\" with title \"{}\"", body, title);
-        let _ = std::process::Command::new("osascript").arg("-e").arg(&sc).spawn();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CNW: u32 = 0x08000000;
-        let temp_dir   = std::env::temp_dir();
-        let script_path = temp_dir.join(format!("toast_{}.ps1", std::process::id()));
-        let title_escaped = title.replace("'", "''");
-        let body_escaped  = body.replace("'", "''");
-        let exe_path      = std::env::current_exe().unwrap_or_default();
-        let exe_path_str  = exe_path.to_string_lossy().replace('\\', "\\\\");
-        let script_content = format!(
-            "$title = '{}'
-            $body = '{}'
-            $exePath = '{}'
-            try {{
-                [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-                $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
-                $textNodes = $template.GetElementsByTagName('text')
-                $textNodes[0].AppendChild($template.CreateTextNode($title)) | Out-Null
-                $textNodes[1].AppendChild($template.CreateTextNode($body)) | Out-Null
-                $appId = '{}.{}'
-                $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
-                $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
-                $toast.Tag = 'FileTransfer'
-                $toast.Group = 'Transfers'
-                $toast.ExpirationTime = [DateTimeOffset]::Now.AddSeconds(30)
-                $notifier.Show($toast)
-            }} catch {{
-                Add-Type -AssemblyName System.Windows.Forms
-                $notification = New-Object System.Windows.Forms.NotifyIcon
-                if (Test-Path $exePath) {{ $notification.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath) }}
-                $notification.BalloonTipTitle = $title
-                $notification.BalloonTipText = $body
-                $notification.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
-                $notification.Visible = $true
-                $notification.ShowBalloonTip(3000)
-                Start-Sleep -Seconds 3
-                $notification.Dispose()
-            }}",
-            title_escaped, body_escaped, exe_path_str,
-            env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")
-        );
-        let _ = std::fs::write(&script_path, script_content);
-        let _ = std::process::Command::new("powershell")
-            .args(["-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", script_path.to_str().unwrap()])
-            .creation_flags(CNW).spawn();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            let _ = std::fs::remove_file(script_path);
-        });
-    }
-    Ok(())
-}
-
-fn open_folder(p: &std::path::Path) {
-    let d = p.parent().unwrap_or(p);
-    #[cfg(target_os = "linux")]   { let _ = std::process::Command::new("xdg-open").arg(d).spawn(); }
-    #[cfg(target_os = "macos")]   { let _ = std::process::Command::new("open").arg(d).spawn(); }
-    #[cfg(target_os = "windows")] {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("cmd").args(["/c", "start", ""]).arg(d).creation_flags(0x08000000).spawn();
-    }
-}
-
-fn open_url(url: &str) {
-    #[cfg(target_os = "linux")]   { let _ = std::process::Command::new("xdg-open").arg(url).spawn(); }
-    #[cfg(target_os = "macos")]   { let _ = std::process::Command::new("open").arg(url).spawn(); }
-    #[cfg(target_os = "windows")] {
-        use std::os::windows::process::CommandExt;
-        const CNW: u32 = 0x08000000;
-        let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).creation_flags(CNW).spawn();
-    }
-}
-
-fn format_size(b: u64) -> String {
-    const U: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut s = b as f64;
-    let mut i = 0;
-    while s >= 1024.0 && i < U.len() - 1 { s /= 1024.0; i += 1; }
-    if i == 0 { format!("{} B", b) } else { format!("{:.1} {}", s, U[i]) }
-}
-
-fn file_icon(name: &str) -> &'static str {
-    let ext = std::path::Path::new(name).extension()
-        .and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    match ext.as_str() {
-        "pdf"  => "📕",
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "bmp" | "webp" | "heic" => icons::ICON_IMAGE,
-        "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" => "🎵",
-        "mp4" | "avi" | "mkv" | "mov" | "webm"         => "🎬",
-        "zip" | "tar" | "gz" | "7z" | "rar"            => "📦",
-        "rs" | "py" | "js" | "ts" | "cpp" | "c" | "java" | "go" | "rb" | "sql" |
-        "html" | "css" | "txt" | "md" | "log"          => "📄",
-        "doc" | "docx" => "📝",
-        "xls" | "xlsx" | "csv" => "📊",
-        "ppt" | "pptx" => "📽️",
-        _ => "📁",
-    }
-}
-
-fn detect_system_theme() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::Command;
-        let output = Command::new("defaults").args(["read", "-g", "AppleInterfaceStyle"]).output();
-        matches!(output, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "Dark")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use winreg::RegKey;
-        use winreg::enums::HKEY_CURRENT_USER;
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
-        if let Ok(key) = hkcu.open_subkey(path) {
-            if let Ok(value) = key.get_value::<u32, _>("AppsUseLightTheme") { return value == 0; }
-        }
-        false
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use std::process::Command;
-        let output = Command::new("gsettings").args(["get", "org.gnome.desktop.interface", "gtk-theme"]).output();
-        if let Ok(o) = output { return String::from_utf8_lossy(&o.stdout).to_lowercase().contains("dark"); }
-        false
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    { false }
 }
 
 fn main() -> eframe::Result<()> {
