@@ -20,7 +20,14 @@ fn main() {
         );
         res.set(
             "CompanyName",
-            &format!("{}", env!("CARGO_PKG_AUTHORS")[0]).as_str(),
+            &format!(
+                "{}",
+                env!("CARGO_PKG_AUTHORS")
+                    .split(',')
+                    .next()
+                    .unwrap_or("Imrany")
+            )
+            .as_str(),
         );
         res.set("LegalCopyright", "Copyright © 2026 Imrany");
         res.set(
