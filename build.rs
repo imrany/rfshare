@@ -10,12 +10,27 @@ fn main() {
         res.set_icon("assets/icon.ico");
 
         // Publisher / version strings shown in Add/Remove Programs and UAC prompts
-        res.set("ProductName", "rfshare");
-        res.set("FileDescription", "Fast, encrypted file transfers");
-        res.set("CompanyName", "Imrany");
+        res.set(
+            "ProductName",
+            &format!("{}", env!("CARGO_PKG_NAME")).as_str(),
+        );
+        res.set(
+            "FileDescription",
+            &format!("{}", env!("CARGO_PKG_DESCRIPTION")).as_str(),
+        );
+        res.set(
+            "CompanyName",
+            &format!("{}", env!("CARGO_PKG_AUTHORS")[0]).as_str(),
+        );
         res.set("LegalCopyright", "Copyright © 2026 Imrany");
-        res.set("ProductVersion", "0.17.1");
-        res.set("FileVersion", "0.17.1");
+        res.set(
+            "ProductVersion",
+            &format!("{}", env!("CARGO_PKG_VERSION")).as_str(),
+        );
+        res.set(
+            "FileVersion",
+            &format!("{}", env!("CARGO_PKG_VERSION")).as_str(),
+        );
 
         // Request the lowest privilege level — prevents UAC elevation prompts.
         // The app only uses local network sockets; it needs no admin rights.

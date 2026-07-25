@@ -1,12 +1,12 @@
 // ─── Shared UI helpers ────────────────────────────────────────────────────────
 use egui::{
-    Align, Align2, Button, Color32, CornerRadius, FontId, Frame, Margin, RichText, Sense, Stroke,
-    StrokeKind, Ui, Vec2,
+    Align, Align2, Button, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense,
+    Stroke, StrokeKind, Ui, Vec2,
 };
 use egui_material_icons::icons;
 
 use crate::{
-    HistoryEntry, Pal, QueueItem, TransferDir, TransferType,
+    App, HistoryEntry, Pal, QueueItem, TransferDir, TransferType, delete_from_history,
     utils::{file_icon, format_size, open_folder, truncate_filename},
 };
 
@@ -27,7 +27,7 @@ pub fn card<R>(ui: &mut Ui, p: &Pal, f: impl FnOnce(&mut Ui) -> R) {
         });
 }
 
-pub fn history_row(ui: &mut Ui, p: &Pal, entry: &HistoryEntry) {
+pub fn history_row(app: &mut App, ui: &mut Ui, p: &Pal, entry: &HistoryEntry) {
     let file_exists = entry.file_exists();
     let is_received = entry.direction == TransferDir::Received;
     let is_remote = entry.transfer_type == TransferType::Remote;
@@ -64,9 +64,9 @@ pub fn history_row(ui: &mut Ui, p: &Pal, entry: &HistoryEntry) {
                     .circle_filled(r.center(), 15.0, tint(dir_col, 22));
                 ui.painter().text(
                     r.center(),
-                    egui::Align2::CENTER_CENTER,
+                    Align2::CENTER_CENTER,
                     dir_icon,
-                    egui::FontId::proportional(14.0),
+                    FontId::proportional(14.0),
                     dir_col,
                 );
                 ui.add_space(10.0);
@@ -88,8 +88,8 @@ pub fn history_row(ui: &mut Ui, p: &Pal, entry: &HistoryEntry) {
                         }
                         if is_remote {
                             status_badge(ui, "REMOTE", p.accent2);
-                        } else {
-                            status_badge(ui, "LOCAL", p.success);
+                            // } else {
+                            //     status_badge(ui, "LOCAL", p.success);
                         }
                     });
                     ui.add_space(2.0);
@@ -125,11 +125,11 @@ pub fn history_row(ui: &mut Ui, p: &Pal, entry: &HistoryEntry) {
                         );
                     }
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.set_width(right_w);
                     ui.vertical(|ui| {
                         ui.set_width(right_w);
-                        ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
+                        ui.with_layout(Layout::top_down(Align::RIGHT), |ui| {
                             ui.label(
                                 RichText::new(entry.time_display())
                                     .size(10.5)
@@ -143,6 +143,22 @@ pub fn history_row(ui: &mut Ui, p: &Pal, entry: &HistoryEntry) {
                                     }
                                 }
                             }
+                            if !app.history.is_empty() {
+                                ui.add_space(4.0);
+                                if ui
+                                    .add(pill_btn(
+                                        format!("{} Delete", icons::ICON_DELETE_HISTORY).as_str(),
+                                        p.danger,
+                                    ))
+                                    .clicked()
+                                {
+                                    if let Ok(new_history) = delete_from_history(app, entry) {
+                                        app.history = new_history;
+                                        app.history_filter.clear();
+                                        println!("Delete me");
+                                    };
+                                }
+                            };
                         });
                     });
                 });
