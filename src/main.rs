@@ -1729,12 +1729,12 @@ impl eframe::App for App {
                                     &format!("{} · {} file{}", format_size(bytes_recv), total_recv, if total_recv == 1 { "" } else { "s" }));
                             });
                         });
-                    }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let device = if self.this_hostname.is_empty() { &self.this_ip } else { &self.this_hostname };
-                        ui.label(RichText::new(device).size(10.5).color(p.text_dim));
-                    });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let device = if self.this_hostname.is_empty() { &self.this_ip } else { &self.this_hostname };
+                            ui.label(RichText::new(device).size(10.5).color(p.text_dim));
+                        });
+                    }
                 });
             });
 
