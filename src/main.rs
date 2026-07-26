@@ -19,6 +19,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 mod utils;
 use utils::{
+    prefs::{
+        load_prefs,
+        save_prefs,
+    },
+    history::{
+        history_path,
+      append_history,
+      HistoryEntry,
+      TransferDir, TransferType,
+      delete_from_history,
+      load_history,
+    },
+    license::{
+        License,
+        Plan
+    },
   detect_system_theme,
   gen_session_code,
   format_size,
@@ -34,9 +50,12 @@ mod ui;
 use ui::{card, big_btn, check_item, drop_hint, drop_zone,history_row,icon_badge,info_row,pill_btn, queue_item_row,
     radar_graphic,status_badge,status_metric,tint};
 
+use crate::utils::prefs::SavedPrefs;
+
 const DISCOVER_PORT:  u16   = 44444;
 const TRANSFER_PORT:  u16   = 44445;
 const DISCOVER_MSG:   &[u8] = b"RFSHARE_DISCOVER";
+const PRO_SALT:       &[u8] = b"rfshare-pro-salt";
 const PEER_PREFIX:    &str  = "RFSHARE_PEER:";
 const CHUNK_SIZE:     usize = 256 * 1024;
 const AES_NONCE_LEN:  usize = 12;
@@ -48,7 +67,7 @@ const MAGIC_DATA:     u8    = 0x03;
 const MAGIC_DONE:     u8    = 0x04;
 const MAGIC_SKIP:     u8    = 0x05; // receiver already has this version — sender should skip
 const SYNC_POLL_MS:   u64   = 2_000; // how often the sync watcher polls each folder
-const RELAY_HOST:     &str  = "relay.triple-ts-mediclinic.com";
+const RELAY_HOST:     &str  = "relay.example.com";
 const RELAY_PORT:     u16   = 80;
 const RFCOMM_CHANNEL: u8    = 10;   // RFCOMM channel used for Bluetooth transfers
 
@@ -210,102 +229,6 @@ fn relay_connect(code: &str, tx: std::sync::mpsc::Sender<RelayMsg>) {
 }
 
 // ─── Persistence helpers ─────────────────────────────────────────────────────
-fn prefs_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(env!("CARGO_PKG_NAME")).join("prefs.json"))
-}
-
-fn save_prefs(
-    peer_name: &str,
-    peer_addr: &str,
-    sync_map: &std::collections::HashMap<String, PathBuf>,
-    save_dir: Option<&PathBuf>,
-    notify_on_receive: bool,
-    auto_open_folder: bool,
-    manual_peers: &[(String,String)],
-    auto_detect_theme: bool,
-    dark_mode: Option<bool>,
-) {
-    let Some(path) = prefs_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut out = String::new();
-    out.push_str(&format!("selected_peer_name={}\n", peer_name));
-    out.push_str(&format!("selected_peer_addr={}\n", peer_addr));
-    for (device_addr, folder) in sync_map {
-        let safe = device_addr.replace('.', "_").replace(':', "_");
-        out.push_str(&format!("sync_device_{}={}\n", safe, folder.display()));
-    }
-    for (i, (name, addr)) in manual_peers.iter().enumerate() {
-        out.push_str(&format!("manual_peer_{}_name={}\n", i, name));
-        out.push_str(&format!("manual_peer_{}_addr={}\n", i, addr));
-    }
-    if let Some(ref d) = save_dir {
-        out.push_str(&format!("save_dir={}\n", d.display()));
-    }
-    out.push_str(&format!("notify_on_receive={}\n", notify_on_receive as u8));
-    out.push_str(&format!("auto_open_folder={}\n", auto_open_folder as u8));
-    out.push_str(&format!("auto_detect_theme={}\n", auto_detect_theme as u8));
-    if let Some(dark) = dark_mode {
-        out.push_str(&format!("dark_mode={}\n", dark as u8));
-    }
-    let _ = fs::write(&path, out);
-}
-
-#[derive(Default)]
-struct SavedPrefs {
-    peer_name: String,
-    peer_addr: String,
-    sync_map: std::collections::HashMap<String, PathBuf>,
-    save_dir: Option<PathBuf>,
-    notify_on_receive: bool,
-    auto_open_folder: bool,
-    manual_peers: Vec<(String, String)>,
-    auto_detect_theme: bool,
-    dark_mode: Option<bool>,
-}
-
-fn load_prefs() -> SavedPrefs {
-    let mut prefs = SavedPrefs::default();
-    let Some(path) = prefs_path() else { return prefs };
-    let Ok(text) = fs::read_to_string(&path) else { return prefs };
-
-    let mut mp_names: std::collections::HashMap<usize, String> = Default::default();
-    let mut mp_addrs: std::collections::HashMap<usize, String> = Default::default();
-
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("selected_peer_name=") { prefs.peer_name = v.to_string(); }
-        if let Some(v) = line.strip_prefix("selected_peer_addr=") { prefs.peer_addr = v.to_string(); }
-        if let Some(rest) = line.strip_prefix("sync_device_") {
-            if let Some(eq) = rest.find('=') {
-                let addr = rest[..eq].replace('_', ".");
-                prefs.sync_map.insert(addr, PathBuf::from(&rest[eq + 1..]));
-            }
-        }
-        if let Some(v) = line.strip_prefix("save_dir=")           { prefs.save_dir = Some(PathBuf::from(v)); }
-        if let Some(v) = line.strip_prefix("notify_on_receive=")  { prefs.notify_on_receive = v == "1"; }
-        if let Some(v) = line.strip_prefix("auto_open_folder=")   { prefs.auto_open_folder  = v == "1"; }
-        if let Some(v) = line.strip_prefix("auto_detect_theme=")  { prefs.auto_detect_theme = v == "1"; }
-        if let Some(v) = line.strip_prefix("dark_mode=")          { prefs.dark_mode = Some(v == "1"); }
-        if let Some(rest) = line.strip_prefix("manual_peer_") {
-            if let Some(idx_end) = rest.find('_') {
-                if let Ok(idx) = rest[..idx_end].parse::<usize>() {
-                    let suffix = &rest[idx_end + 1..];
-                    if let Some(v) = suffix.strip_prefix("name=") { mp_names.insert(idx, v.to_string()); }
-                    if let Some(v) = suffix.strip_prefix("addr=") { mp_addrs.insert(idx, v.to_string()); }
-                }
-            }
-        }
-    }
-
-    let mut i = 0;
-    while let (Some(name), Some(addr)) = (mp_names.remove(&i), mp_addrs.remove(&i)) {
-        prefs.manual_peers.push((name, addr));
-        i += 1;
-    }
-    prefs
-}
-
 fn toggle_switch(ui: &mut egui::Ui, p: &Pal, on: bool) -> egui::Response {
     let desired = Vec2::new(36.0, 20.0);
     let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
@@ -471,57 +394,6 @@ fn device_row(
     resp
 }
 
-// ─── License ─────────────────────────────────────────────────────────────────
-#[derive(Clone, Debug, PartialEq)]
-enum Plan { Free, Pro }
-
-#[derive(Clone, Debug)]
-struct License {
-    plan:  Plan,
-    email: String,
-    key:   String,
-}
-
-impl License {
-    fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join(env!("CARGO_PKG_NAME")).join("license"))
-    }
-    fn load() -> Self {
-        let path = Self::config_path();
-        if let Some(p) = &path {
-            if let Ok(text) = fs::read_to_string(p) {
-                let mut email = String::new();
-                let mut key = String::new();
-                for line in text.lines() {
-                    if let Some(v) = line.strip_prefix("email=") { email = v.trim().to_string(); }
-                    if let Some(v) = line.strip_prefix("key=")   { key   = v.trim().to_string(); }
-                }
-                if Self::validate_key(&key) {
-                    return Self { plan: Plan::Pro, email, key };
-                }
-            }
-        }
-        Self { plan: Plan::Free, email: String::new(), key: String::new() }
-    }
-    fn save(&self) {
-        if let Some(p) = Self::config_path() {
-            if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
-            let _ = fs::write(&p, format!("email={}\nkey={}\n", self.email, self.key));
-        }
-    }
-    fn validate_key(key: &str) -> bool {
-        let parts: Vec<&str> = key.split('-').collect();
-        if parts.len() != 5 || parts.iter().any(|p| p.len() != 5) { return false; }
-        let body = parts[..4].join("-");
-        let mut h = Sha256::new();
-        h.update(body.as_bytes());
-        h.update(b"rfshare-pro-salt");
-        let hash = format!("{:X}", h.finalize());
-        parts[4].to_uppercase() == hash[..5].to_uppercase()
-    }
-    fn is_pro(&self) -> bool { self.plan == Plan::Pro }
-}
-
 // ─── Palette ─────────────────────────────────────────────────────────────────
 pub struct Pal {
     bg: Color32, surface: Color32, surface2: Color32, border: Color32,
@@ -566,153 +438,6 @@ impl Pal {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum TransferType { Local, Remote }
-
-// ─── History ─────────────────────────────────────────────────────────────────
-#[derive(Clone, Debug, PartialEq)]
-pub struct HistoryEntry {
-    timestamp: u64,
-    direction: TransferDir,
-    file_name: String,
-    file_size: u64,
-    peer_name: String,
-    success:   bool,
-    error:     Option<String>,
-    transfer_type: TransferType,
-    file_path: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum TransferDir { Sent, Received }
-
-impl HistoryEntry {
-    fn time_display(&self) -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let diff = now.saturating_sub(self.timestamp);
-
-        if diff < 60 {
-            "just now".into()
-        } else if diff < 3600 {
-            format!("{} min ago", diff / 60)
-        } else if diff < 86400 {
-            format!("{} hr ago", diff / 3600)
-        } else if diff < 604800 {
-            format!("{} days ago", diff / 86400)
-        } else {
-            format!("{} wks ago", diff / 604800)
-        }
-    }
-    fn file_exists(&self) -> bool {
-        self.file_path.as_ref().map(|p| p.exists()).unwrap_or(false)
-    }
-
-    // Helper to format an entry consistently for CSV writing
-    fn to_csv_line(&self) -> String {
-            let dir = if self.direction == TransferDir::Sent { "sent" } else { "received" };
-            let trans_type = if self.transfer_type == TransferType::Local { "local" } else { "remote" };
-            let err = self.error.as_deref().unwrap_or("").replace(',', ";");
-            let fpath = self.file_path.as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default()
-                .replace(',', ";");
-            let success = if self.success { 1 } else { 0 };
-
-            format!(
-                "{},{},{},{},{},{},{},{},{}\n",
-                self.timestamp, dir, trans_type, self.file_name, self.file_size, self.peer_name, success, err, fpath
-            )
-    }
-}
-
-fn history_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(env!("CARGO_PKG_NAME")).join("history.csv"))
-}
-
-fn load_history() -> Vec<HistoryEntry> {
-    let Some(path) = history_path() else { return Vec::new(); };
-    let Ok(text) = fs::read_to_string(&path) else { return Vec::new(); };
-    let mut out = Vec::new();
-    for line in text.lines().skip(1) {
-        let cols: Vec<&str> = line.splitn(9, ',').collect();
-        if cols.len() < 8 { continue; }
-        let ts  = cols[0].parse::<u64>().unwrap_or(0);
-        let dir = if cols[1] == "sent" { TransferDir::Sent } else { TransferDir::Received };
-        let trans_type = if cols.len() >= 3 {
-            if cols[2] == "remote" { TransferType::Remote } else { TransferType::Local }
-        } else { TransferType::Local };
-        let name  = if cols.len() >= 4 { cols[3].to_string() } else { cols[2].to_string() };
-        let size  = if cols.len() >= 5 { cols[4].parse::<u64>().unwrap_or(0) } else { cols[3].parse::<u64>().unwrap_or(0) };
-        let peer  = if cols.len() >= 6 { cols[5].to_string() } else { cols[4].to_string() };
-        let success    = if cols.len() >= 7 { cols[6] == "1" } else { cols[5] == "1" };
-        let err   = if cols.len() >= 8 { if cols[7].is_empty() { None } else { Some(cols[7].to_string()) } }
-                    else               { if cols[6].is_empty() { None } else { Some(cols[6].to_string()) } };
-        let fpath = cols.get(8).filter(|s| !s.is_empty()).map(|s| PathBuf::from(s));
-        out.push(HistoryEntry {
-            timestamp: ts, direction: dir, transfer_type: trans_type,
-            file_name: name, file_size: size, peer_name: peer,
-            success, error: err, file_path: fpath,
-        });
-    }
-    out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    out
-}
-
-fn append_history(entry: &HistoryEntry) {
-    let Some(path) = history_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    let needs_header = !path.exists();
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        if needs_header {
-            let _ = writeln!(f, "timestamp,direction,type,name,size,peer,success,error,file_path");
-        }
-        let _ = f.write_all(entry.to_csv_line().as_bytes());
-    }
-}
-
-// Rewrites the ENTIRE file with a fresh list of remaining vector entries
-fn save_all_history(entries: &[HistoryEntry]) -> std::io::Result<()> {
-    let Some(path) = history_path() else {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "History path unavailable"));
-    };
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut f = fs::File::create(&path)?;
-    writeln!(f, "timestamp,direction,type,name,size,peer,success,error,file_path")?;
-    for entry in entries {
-        f.write_all(entry.to_csv_line().as_bytes())?;
-    }
-    Ok(())
-}
-
-fn delete_from_history(app: &mut App, entry: &HistoryEntry) -> Result<Vec<HistoryEntry>, String> {
-    if app.history.is_empty() {
-        return Err("History memory is already empty".to_string());
-    }
-
-    // Filter out the target entry
-    let updated_history: Vec<HistoryEntry> = app.history
-        .iter()
-        .filter(|en| *en != entry)
-        .cloned()
-        .collect();
-
-    // Persist changes to disk safely
-    if let Err(e) = save_all_history(&updated_history) {
-        return Err(format!("Failed to save updated history: {}", e));
-    }
-
-    Ok(updated_history)
-}
 
 // ─── Folder sync ─────────────────────────────────────────────────────────────
 #[derive(Clone, Debug)]
@@ -1041,9 +766,18 @@ impl App {
             .collect();
         let mut all_sync = self.sync_map.clone();
         all_sync.extend(self.relay_sync_map.clone());
-        save_prefs(name, &addr, &all_sync, Some(&self.save_dir),
-            self.notify_on_receive, self.auto_open_folder, &manual,
-            self.auto_detect_theme, Some(self.dark_mode));
+
+        save_prefs(SavedPrefs{
+            peer_name: name.to_string(),
+            peer_addr: addr.to_string(),
+            sync_map: all_sync,
+            save_dir:Some(self.save_dir.clone()),
+            notify_on_receive:self.notify_on_receive,
+            auto_open_folder:self.auto_open_folder,
+            manual_peers:manual,
+            auto_detect_theme:self.auto_detect_theme,
+            dark_mode: Some(self.dark_mode)
+        });
     }
 
     fn start_scan(&mut self) {

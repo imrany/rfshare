@@ -1,3 +1,7 @@
+pub mod history;
+pub mod license;
+pub mod prefs;
+
 use std::{
     net::UdpSocket,
     path::{Path, PathBuf},

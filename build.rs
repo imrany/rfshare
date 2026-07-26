@@ -29,7 +29,10 @@ fn main() {
             )
             .as_str(),
         );
-        res.set("LegalCopyright", "Copyright © 2026 Imrany");
+        res.set(
+            "LegalCopyright",
+            &format!("Copyright © 2026 {}", env!("CARGO_PKG_NAME")).as_str(),
+        );
         res.set(
             "ProductVersion",
             &format!("{}", env!("CARGO_PKG_VERSION")).as_str(),
