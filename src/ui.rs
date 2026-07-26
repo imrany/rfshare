@@ -1,7 +1,7 @@
 // ─── Shared UI helpers ────────────────────────────────────────────────────────
 use egui::{
     Align, Align2, Button, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense,
-    Stroke, StrokeKind, Ui, Vec2,
+    Stroke, StrokeKind, TextBuffer, Ui, Vec2,
 };
 use egui_material_icons::icons;
 
@@ -111,7 +111,8 @@ pub fn history_row(app: &mut App, ui: &mut Ui, p: &Pal, entry: &HistoryEntry) {
                     if let Some(ref fpath) = entry.file_path {
                         let path_str = fpath.to_string_lossy();
                         let display = if path_str.len() > 50 {
-                            format!("…{}", &path_str[path_str.len().saturating_sub(59)..])
+                            format!("{}", truncate_filename(&path_str.as_str(), 48))
+                            // format!("…{}", &path_str[path_str.len().saturating_sub(59)..])
                         } else {
                             path_str.to_string()
                         };
