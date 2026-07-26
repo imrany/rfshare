@@ -92,12 +92,12 @@ Adds rfshare to your PATH, creates a Start Menu shortcut, and registers it in Ad
 
 **Linux / macOS**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash -s -- --version v0.17.2
+curl -fsSL https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.sh | bash -s -- --version v0.17.3
 ```
 
 **Windows**
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.ps1))) -Version v0.15.0
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/imrany/rfshare/main/scripts/install.ps1))) -Version v0.17.3
 ```
 
 ### Uninstall
@@ -142,11 +142,11 @@ Each file has a matching `.sha256` checksum.
    - Desktop notifications appear when transfers complete
    - View received files in the **History** tab
 
-4. **Remote sharing (Pro)**:
+4. **Remote sharing**:
    - **Receiver**: Click **Scan** → **Remote** → **Go Online** → Share the code
    - **Sender**: Click **Scan** → **Remote** → Enter code → **Connect** → Send files
 
-5. **Folder sync (Pro)**:
+5. **Folder sync**:
    - Select a device
    - Go to **Sync** tab
    - Click **Set folder to watch**
@@ -194,26 +194,12 @@ Each file has a matching `.sha256` checksum.
 | Transfer History | ✅ | ✅ |
 | Drag & Drop | ✅ | ✅ |
 | Desktop Notifications | ✅ | ✅ |
-| **Remote Transfer** | ❌ | ✅ |
-| **Folder Sync** | ❌ | ✅ |
-| **Remote Folder Sync** | ❌ | ✅ |
-| **Unlimited Devices** | ❌ | ✅ |
-| **Organization License** | ❌ | ✅ |
+| **Remote Transfer** | ✅ | ✅ |
+| **Folder Sync** | ✅ | ✅ |
+| **Remote Folder Sync** | ✅ | ✅ |
+| **Unlimited Devices** | ✅ | ✅ |
 
-## 💰 Pro License
-
-### Activate Pro
-
-1. Go to **Settings** → **License**
-2. Enter your license key
-3. Click **Activate**
-
-**Pro License Key:**
-```bash
-29714-5B90A-54A40-254F4-B7B1C
-```
-
-### Get a License
+### Sponsor the project
 
 Support development and get Pro features:
 - [GitHub Sponsors](https://github.com/sponsors/imrany)
@@ -258,7 +244,6 @@ cargo build --release
 ### Files
 - `prefs.json` - User preferences and settings
 - `history.csv` - Transfer history log
-- `license` - Pro license information
 
 ## 🔐 Security Details
 
@@ -308,7 +293,6 @@ cargo build --release
 - **Linux**: Run `rfshare` in terminal or find in application menu
 
 **Q: Folder sync isn't working**
-- Ensure you have a Pro license activated
 - Check that the selected device is online
 - Verify the folder exists and is readable
 - Look at the Activity log for errors

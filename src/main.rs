@@ -31,10 +31,6 @@ use utils::{
       delete_from_history,
       load_history,
     },
-    license::{
-        License,
-        Plan
-    },
   detect_system_theme,
   gen_session_code,
   format_size,
@@ -55,7 +51,6 @@ use crate::utils::prefs::SavedPrefs;
 const DISCOVER_PORT:  u16   = 44444;
 const TRANSFER_PORT:  u16   = 44445;
 const DISCOVER_MSG:   &[u8] = b"RFSHARE_DISCOVER";
-const PRO_SALT:       &[u8] = b"rfshare-pro-salt";
 const PEER_PREFIX:    &str  = "RFSHARE_PEER:";
 const CHUNK_SIZE:     usize = 256 * 1024;
 const AES_NONCE_LEN:  usize = 12;
@@ -509,7 +504,7 @@ enum Tab { Scan, Send, History, Sync, Settings }
 enum ScanState { Idle, Scanning, Done }
 
 #[derive(Clone, Debug, PartialEq)]
-enum SettingsTab { Device, License, About, Preferences }
+enum SettingsTab { Device, About, Preferences }
 
 #[derive(Clone, Debug)]
 struct ReceivedFile {
@@ -581,16 +576,11 @@ pub struct App {
     sync_map:    std::collections::HashMap<String, PathBuf>,
     scan_filter: String,
 
-    license:          License,
     settings_tab:     SettingsTab,
-    license_key_buf:  String,
-    license_email_buf: String,
-    license_msg:      Option<(String, bool)>,
 
     tab:          Tab,
     dark_mode:    bool,
     scan_pulse:   f32,
-    show_upgrade: bool,
     version:      String,
 
     this_hostname: String,
@@ -668,7 +658,6 @@ impl Default for App {
             rs.auto_open_folder  = prefs.auto_open_folder;
             rs.save_dir          = prefs.save_dir.clone();
         }
-        let license = License::load();
         Self {
             peers:      Vec::new(),
             scan_rx:    None,
@@ -687,15 +676,11 @@ impl Default for App {
             sync_log:    Vec::new(),
             sync_map:    prefs.sync_map,
             scan_filter: String::new(),
-            license_key_buf:   String::new(),
-            license_email_buf: String::new(),
-            license_msg:       None,
             settings_tab:      SettingsTab::Device,
             tab:          Tab::Scan,
             auto_detect_theme: initial_auto_detect,
             dark_mode:    initial_dark_mode,
             scan_pulse:   0.0,
-            show_upgrade: false,
             version:      format!("v{}", env!("CARGO_PKG_VERSION")),
             this_hostname: hostname(),
             this_ip:       local_ip(),
@@ -709,7 +694,6 @@ impl Default for App {
             session_sent_files: 0,
             update_available: None,
             update_rx:        None,
-            license,
             remote_ip_buf:   String::new(),
             remote_name_buf: String::new(),
             remote_msg:      None,
@@ -744,8 +728,6 @@ impl Default for App {
 
 impl App {
     fn p(&self) -> Pal { if self.dark_mode { Pal::dark() } else { Pal::light() } }
-    fn is_pro(&self) -> bool { self.license.is_pro() }
-
     fn check_internet_connection(&self) -> bool {
         std::net::TcpStream::connect_timeout(
             &("8.8.8.8:53").parse().unwrap(),
@@ -794,7 +776,7 @@ impl App {
             if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
                 let _ = sock.set_broadcast(true);
                 let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(250)));
-                for dest in ["255.255.255.255", "192.168.1.255", "192.168.0.255", "10.0.0.255"] {
+                for dest in ["255.255.255.255", "192.168.1.255", "192.168.0.255", "10.0.0.255", "10.255.255.255"] {
                     let _ = sock.send_to(DISCOVER_MSG, (dest, DISCOVER_PORT));
                 }
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -931,7 +913,6 @@ impl App {
     }
 
     fn start_sync_watcher(&mut self) {
-        if !self.is_pro() { self.show_upgrade = true; return; }
         if self.sync_jobs.is_empty() || self.sync_active { return; }
         self.sync_active = true;
         let jobs = self.sync_jobs.clone();
@@ -990,7 +971,6 @@ impl App {
     }
 
     fn add_sync_folder(&mut self, folder: PathBuf) {
-        if !self.is_pro() { self.show_upgrade = true; return; }
         let Some(peer) = self.selected_peer().cloned() else { return; };
         let addr_key = peer.addr.to_string();
         if self.sync_active { self.sync_rx = None; self.sync_active = false; }
@@ -1054,7 +1034,7 @@ impl App {
                 }
                 if self.selected.is_some() {
                     self.rebuild_sync_jobs();
-                    if !self.sync_active && self.is_pro() {
+                    if !self.sync_active {
                         if let Some(peer) = self.selected_peer() {
                             let has_folders = self.sync_map.get(&peer.addr.to_string()).is_some();
                             if has_folders { self.start_sync_watcher(); }
@@ -1461,7 +1441,6 @@ impl App {
     }
 
     fn start_relay_sync_watcher(&mut self) {
-        if !self.is_pro() { self.show_upgrade = true; return; }
         if self.relay_sync_jobs.is_empty() || self.relay_sync_active { return; }
         if !self.is_relay_mode || self.relay_stream.is_none() {
             self.remote_msg = Some(("Cannot start remote sync: No active relay connection".into(), true));
@@ -1523,7 +1502,6 @@ impl App {
     }
 
     fn add_relay_sync_folder(&mut self, folder: PathBuf) {
-        if !self.is_pro() { self.show_upgrade = true; return; }
         if !self.is_relay_mode {
             self.remote_msg = Some(("Remote sync requires an active relay connection".into(), true));
             return;
@@ -1623,57 +1601,6 @@ impl eframe::App for App {
             }
         });
 
-        // ── Upgrade modal ──────────────────────────────────────────────────
-        if self.show_upgrade {
-            let p2 = self.p();
-            egui::Window::new("Upgrade to Pro")
-                .collapsible(false).resizable(false).min_width(360.0)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .frame(egui::Frame::new().fill(p2.surface).stroke(Stroke::new(1.0_f32, p2.border)).corner_radius(16.0))
-                .show(ctx, |ui| {
-                    ui.add_space(8.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(format!("{} Pro", env!("CARGO_PKG_NAME"))).size(20.0).strong().color(p2.pro));
-                        ui.add_space(6.0);
-                        ui.label(RichText::new("$5/month  or  $48/year").size(13.0).color(p2.text_dim));
-                        ui.add_space(16.0);
-                        let feat_w = 300.0f32;
-                        for (icon, feat) in [
-                            (icons::ICON_GLOBE, "Remote file sharing"),
-                            ("📁", "Folder sync — auto-send new files in a folder"),
-                            ("🏢", "Unlimited devices  /  org license"),
-                            ("🔐", "End-to-end encrypted transfers"),
-                        ] {
-                            ui.allocate_ui_with_layout(Vec2::new(feat_w, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                let (r, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
-                                ui.painter().circle_filled(r.center(), 13.0, tint(p2.accent, 18));
-                                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(14.0), Color32::WHITE);
-                                ui.add_space(10.0);
-                                ui.label(RichText::new(feat).size(12.0).color(p2.text));
-                            });
-                            ui.add_space(4.0);
-                        }
-                        ui.add_space(16.0);
-                        if ui.add(egui::Button::new(RichText::new("  Get Pro  ").size(14.0).strong().color(Color32::BLACK))
-                            .fill(p2.pro).corner_radius(10.0).min_size(Vec2::new(160.0, 42.0))).clicked()
-                        {
-                            open_url("https://github.com/sponsors/imrany");
-                        }
-                        ui.add_space(6.0);
-                        if ui.add(egui::Button::new(RichText::new("I have a key").size(11.0).color(p2.text_dim)).frame(false)).clicked() {
-                            self.show_upgrade = false;
-                            self.tab          = Tab::Settings;
-                            self.settings_tab = SettingsTab::License;
-                        }
-                        ui.add_space(4.0);
-                        if ui.add(egui::Button::new(RichText::new("Not now").size(11.0).color(p2.text_faint)).frame(false)).clicked() {
-                            self.show_upgrade = false;
-                        }
-                        ui.add_space(8.0);
-                    });
-                });
-        }
-
         // ── Top bar ────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("topbar")
             .frame(egui::Frame::new().fill(p.surface).inner_margin(egui::Margin { left: 20, right: 12, top: 0, bottom: 0 }))
@@ -1686,23 +1613,22 @@ impl eframe::App for App {
                     ui.label(RichText::new(env!("CARGO_PKG_NAME")).size(15.0).strong().color(p.text));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let tab_defs: &[(&str, Tab, bool)] = &[
-                            ("Settings", Tab::Settings, false),
-                            ("History",  Tab::History,  false),
-                            ("Sync",     Tab::Sync,     !self.is_pro()),
-                            ("Send",     Tab::Send,     false),
-                            ("Scan",     Tab::Scan,     false),
+                        let tab_defs: &[(&str, Tab)] = &[
+                            ("Settings", Tab::Settings),
+                            ("History",  Tab::History),
+                            ("Sync",     Tab::Sync),
+                            ("Send",     Tab::Send),
+                            ("Scan",     Tab::Scan),
                         ];
                         let history_new = self.recv_state.lock()
                             .map(|rs| rs.files.iter().filter(|f| !f.seen).count()).unwrap_or(0);
-                        for (lbl, t, locked) in tab_defs {
+                        for (lbl, t) in tab_defs {
                             let active = &self.tab == t;
-                            let col = if active { p.accent } else if *locked { p.text_faint } else { p.text_dim };
-                            let display = if *locked { format!("{lbl}  🔒") } else { lbl.to_string() };
+                            let col = if active { p.accent } else { p.text_dim };
+                            let display =  lbl.to_string();
                             let resp = ui.add(egui::Button::new(RichText::new(&display).size(12.5).color(col))
                                 .frame(false).min_size(Vec2::new(0.0, 52.0)));
                             if resp.clicked() {
-                                if *locked { self.show_upgrade = true; } else {
                                     self.tab = t.clone();
                                     if self.tab == Tab::History {
                                         if let Ok(mut rs) = self.recv_state.lock() {
@@ -1710,7 +1636,6 @@ impl eframe::App for App {
                                         }
                                         self.history = load_history();
                                     }
-                                }
                             }
                             if active {
                                 let r = resp.rect;
@@ -1807,12 +1732,6 @@ impl eframe::App for App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.is_pro() {
-                            let (r, _) = ui.allocate_exact_size(Vec2::new(26.0, 14.0), Sense::hover());
-                            ui.painter().rect_filled(r, 3.0, tint(p.pro, 30));
-                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "PRO", egui::FontId::proportional(8.0), p.pro);
-                            ui.add_space(6.0);
-                        }
                         let device = if self.this_hostname.is_empty() { &self.this_ip } else { &self.this_hostname };
                         ui.label(RichText::new(device).size(10.5).color(p.text_dim));
                     });
@@ -1848,7 +1767,6 @@ impl App {
                             self.last_internet_check = std::time::Instant::now();
                         }
 
-                        if self.is_pro() {
                             for (label, mode) in [("  Local  ", ScanMode::Local), ("  Remote  ", ScanMode::Remote)] {
                                 let active = self.scan_mode == mode;
                                 let (fill, text_col) = if active { (p.accent, Color32::WHITE) } else { (p.surface2, p.text_dim) };
@@ -1859,7 +1777,6 @@ impl App {
                                 }
                             }
                             ui.add_space(8.0);
-                        }
 
                         if self.scan_mode == ScanMode::Local {
                             let n = self.peers.iter().filter(|p| matches!(p.kind, PeerKind::Local)).count();
@@ -2690,9 +2607,7 @@ impl App {
                             else          { format!("{}  Set folder to watch", icons::ICON_FOLDER) }
                         };
                         if ui.add(pill_btn(&btn_text, p.accent)).clicked() {
-                            if !self.is_pro() {
-                                self.show_upgrade = true;
-                            } else if is_relay_mode && !self.is_relay_mode {
+                           if is_relay_mode && !self.is_relay_mode {
                                 self.remote_msg = Some(("Please connect via remote mode first".into(), true));
                             } else if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                                 if is_relay_mode { self.add_relay_sync_folder(folder); } else { self.add_sync_folder(folder); }
@@ -2805,7 +2720,6 @@ impl App {
                     ui.horizontal(|ui| {
                         for (lbl, st) in [
                             ("Device",      SettingsTab::Device),
-                            ("License",     SettingsTab::License),
                             ("Preferences", SettingsTab::Preferences),
                             ("About",       SettingsTab::About),
                         ] {
@@ -2825,7 +2739,6 @@ impl App {
 
                     match self.settings_tab {
                         SettingsTab::Device      => self.show_device_panel(ui),
-                        SettingsTab::License     => self.show_license_panel(ui),
                         SettingsTab::Preferences => self.show_preferences_panel(ui),
                         SettingsTab::About       => self.show_about_panel(ui),
                     }
@@ -2894,65 +2807,6 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(RichText::new("Go to the Send tab, scan, and select a device.").size(11.0).color(p.text_faint));
             });
-        }
-    }
-
-    fn show_license_panel(&mut self, ui: &mut egui::Ui) {
-        let p = self.p();
-        if self.is_pro() {
-            egui::Frame::new()
-                .fill(tint(p.pro, 15)).stroke(Stroke::new(1.0_f32, tint(p.pro, 55)))
-                .corner_radius(12.0).inner_margin(egui::Margin::same(16))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("★").size(24.0).color(p.pro));
-                        ui.add_space(10.0);
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(format!("{} Pro — Active", env!("CARGO_PKG_NAME")))
-                                .strong().size(14.0).color(p.pro));
-                            ui.label(RichText::new(&self.license.email).size(12.0).color(p.text_dim));
-                        });
-                    });
-                    ui.add_space(12.0);
-                    if ui.add(pill_btn("Deactivate", p.danger)).clicked() {
-                        self.license = License { plan: Plan::Free, email: String::new(), key: String::new() };
-                        if let Some(path) = License::config_path() { let _ = fs::remove_file(path); }
-                        self.license_msg = Some(("License deactivated.".into(), false));
-                    }
-                });
-        } else {
-            ui.label(RichText::new("Activate Pro License").strong().size(14.0).color(p.text));
-            ui.add_space(8.0);
-            ui.label(RichText::new("Email").size(11.0).color(p.text_dim));
-            ui.add(egui::TextEdit::singleline(&mut self.license_email_buf)
-                .hint_text("your@email.com").desired_width(f32::INFINITY));
-            ui.add_space(8.0);
-            ui.label(RichText::new("License Key").size(11.0).color(p.text_dim));
-            ui.add(egui::TextEdit::singleline(&mut self.license_key_buf)
-                .hint_text("XXXXX-XXXXX-XXXXX-XXXXX-XXXXX").desired_width(f32::INFINITY));
-            ui.add_space(12.0);
-            let can = !self.license_email_buf.is_empty() && self.license_key_buf.len() >= 29;
-            ui.add_enabled_ui(can, |ui| {
-                if ui.add(egui::Button::new(RichText::new("  Activate  ").size(13.0).strong().color(Color32::WHITE))
-                    .fill(p.accent).corner_radius(10.0).min_size(Vec2::new(ui.available_width(), 42.0))).clicked()
-                {
-                    if License::validate_key(&self.license_key_buf) {
-                        self.license = License { plan: Plan::Pro, email: self.license_email_buf.clone(), key: self.license_key_buf.clone() };
-                        self.license.save();
-                        self.license_msg = Some((format!("Pro activated! Enjoy {} Pro.", env!("CARGO_PKG_NAME")).into(), false));
-                        self.license_key_buf.clear();
-                    } else {
-                        self.license_msg = Some(("Invalid license key. Check and try again.".into(), true));
-                    }
-                }
-            });
-            ui.add_space(8.0);
-            if ui.add(pill_btn("Buy a license", p.pro)).clicked() { open_url("https://github.com/sponsors/imrany"); }
-        }
-        if let Some((msg, is_err)) = &self.license_msg {
-            ui.add_space(10.0);
-            let col = if *is_err { p.danger } else { p.success };
-            ui.label(RichText::new(msg).size(12.0).color(col));
         }
     }
 

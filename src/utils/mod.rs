@@ -1,5 +1,4 @@
 pub mod history;
-pub mod license;
 pub mod prefs;
 
 use std::{
